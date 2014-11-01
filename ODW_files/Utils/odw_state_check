@@ -1,0 +1,92 @@
+#!/usr/bin/perl
+#
+# Copyright (C) 2003-2012 Opsview Limited. All rights reserved
+#
+# This is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+#
+# This software is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with Opsview; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
+
+use warnings;
+use strict;
+use FindBin qw($Bin $Script);
+use lib "$Bin/../lib", "$Bin/../etc", "$Bin/../perl/lib";
+use DateTime;
+use Odw;
+use Runtime::Schema;
+use Data::Dump qw(dump);
+use Getopt::Std;
+use Log::Log4perl;
+
+my $rootdir = "/usr/local/nagios";
+Log::Log4perl::init("$rootdir/etc/Log4perl.conf");
+$0 = "odw_state_check";
+my $logger = Log::Log4perl->get_logger($0);
+
+my $opts = {};
+getopts( "y", $opts ) or die "Invalid opts";
+
+my $change = $opts->{y};
+
+if ($change) {
+    $logger->info("Running odw_state_check");
+}
+
+my $runtime = Runtime::Schema->my_connect;
+my $odw     = Odw->db_Main;
+
+# Get service_saved_state from ODW
+my $latest_time = $odw->selectrow_array("SELECT MAX(start_timev) FROM service_saved_state");
+my $sth         = $odw->prepare("SELECT * FROM service_saved_state WHERE start_timev = ?");
+$sth->execute($latest_time);
+
+my $service_saved_state;
+while ( my $row = $sth->fetchrow_hashref ) {
+    $service_saved_state->{ $row->{hostname} . "::" . $row->{servicename} } = {
+        last_state      => $row->{last_state},
+        last_hard_state => $row->{last_hard_state},
+        acknowledged    => $row->{acknowledged},
+    };
+}
+
+# Get current host runtime state
+my $host_state;
+my $rs = $runtime->resultset("NagiosHoststatus")->search( {}, { join => "opsview_host" } );
+while ( my $hoststatus = $rs->next ) {
+    $host_state->{ $hoststatus->opsview_host->name } = { acknowledged => $hoststatus->problem_has_been_acknowledged, };
+}
+
+# Get current service runtime state
+my $service_state;
+$rs = $runtime->resultset("NagiosServicestatus")->search( {}, { join => "object" } );
+while ( my $servicestatus = $rs->next ) {
+    $service_state->{ $servicestatus->object->hostname . "::" . $servicestatus->object->name2 } = { acknowledged => $servicestatus->problem_has_been_acknowledged || $host_state->{ $servicestatus->object->hostname }->{acknowledged}, };
+}
+
+# Compare differences
+$sth = $odw->prepare("UPDATE service_saved_state SET acknowledged=? WHERE hostname=? AND servicename=?");
+foreach my $hs ( sort keys %$service_saved_state ) {
+    if ( ( my $state_odw = $service_saved_state->{$hs}->{acknowledged} ) != ( my $state_runtime = $service_state->{$hs}->{acknowledged} ) ) {
+        print "$hs: ODW=$state_odw, Runtime=$state_runtime\n";
+
+        if ($change) {
+            my ( $hostname, $servicename ) = split( "::", $hs );
+            $logger->info("Updating $hs: ODW=$state_odw, Runtime=$state_runtime");
+            $sth->execute( $state_runtime, $hostname, $servicename );
+        }
+    }
+}
+
+if ($change) {
+    print "Synchronised ODW\n";
+    $logger->info("Finished synchronising ODW with Runtime");
+}

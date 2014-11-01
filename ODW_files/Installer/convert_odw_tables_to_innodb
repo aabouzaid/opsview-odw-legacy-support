@@ -1,0 +1,222 @@
+#!/usr/bin/perl
+#
+# AUTHORS:
+#    Copyright (C) 2003-2012 Opsview Limited. All rights reserved
+#
+#    This file is part of Opsview
+#
+#    Opsview is free software; you can redistribute it and/or modify
+#    it under the terms of the GNU General Public License as published by
+#    the Free Software Foundation; either version 2 of the License, or
+#    (at your option) any later version.
+#
+#    Opsview is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    GNU General Public License for more details.
+#
+#    You should have received a copy of the GNU General Public License
+#    along with Opsview; if not, write to the Free Software
+#    Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
+
+use strict;
+use warnings;
+
+use FindBin qw($Bin $Script);
+use lib '/usr/local/nagios/perl/lib';
+use lib $Bin. '/../lib';
+
+use IO::File;
+
+use Odw;
+use Opsview::Config;
+
+use Getopt::Long qw(:config no_ignore_case bundling no_auto_abbrev);
+use Pod::Usage;
+use POSIX qw/ ceil /;
+
+my $VERSION = '0.01';
+
+my %options = (
+    'help|h|?'  => 0,
+    'man'       => 0,
+    'version|V' => 0,
+    'debug:+'   => 0,
+    'force|f'   => 0,
+);
+
+GetOptions( \%options, keys(%options) ) || pod2usage( -verbose => 1 );
+
+die("Version: $VERSION\n") if ( $options{version} );
+pod2usage( -verbose => 1 ) if ( $options{'?'} || $options{help} );
+pod2usage( -verbose => 2 ) if ( $options{man} );
+
+$options{debug} ||= 0;
+$options{debug} = 8 if ( $options{debug} > 8 );
+
+sub logmsg($@) {
+    my ( $level, @text ) = @_;
+    print @text, $/ if ( $level <= $options{debug} );
+}
+
+my $dbh = Odw->db_Main;
+
+logmsg( 1, "Script $Script is running out of $Bin" );
+
+# get mysql data dir area
+my $mysql_data_dir = ( $dbh->selectrow_array(q{ SHOW VARIABLES LIKE 'datadir' }) )[1];
+
+# check to ensure some basic tuning has been done
+my $mysql_innodb_file_per_table = ( $dbh->selectrow_array(q{ SHOW VARIABLES LIKE 'innodb_file_per_table' }) )[1];
+
+logmsg( 1, 'MySQL data directory is: ', $mysql_data_dir );
+
+logmsg( 2, 'innodb_file_per_tabledatadir set to: ', $mysql_innodb_file_per_table );
+
+if ( $mysql_innodb_file_per_table ne 'ON' ) {
+    warn 'WARNING: innodb_file_per_tabledatadir is not set correctly - has tuning been done?',        $/;
+    warn 'See: http://docs.opsview.com/doku.php?id=opsview-community:mysql#mysql_performance_tuning', $/;
+}
+
+sub get_space {
+    my @df_output = `df -Pk $mysql_data_dir`;
+    if ( !@df_output ) {
+        die( 'Unable to read output from "df -Pk /"', $/ );
+    }
+    my @line = split( / +/, $df_output[1] );
+    return $line[3];
+}
+
+my $total_space_required = 0;
+my @tables;
+
+my $sth = $dbh->prepare(q{ SHOW TABLE STATUS WHERE ENGINE = 'MYISAM' });
+$sth->execute();
+while ( my $row = $sth->fetchrow_hashref() ) {
+    logmsg( 1, 'Table: ', $row->{name} );
+
+    push( @tables, $row->{name} );
+
+    my $space_used = $row->{data_length} + $row->{index_length} - $row->{data_free};
+
+    # also add in extra 30% as InnoDB tables take up more space
+    my $space_required = $space_used * 1.30;
+
+    #convert space_required to Kb and round up
+    $space_required = ceil( $space_required / 1024 );
+    $space_used     = ceil( $space_used / 1024 );
+
+    logmsg( 2, '- used: ',    $space_used,     'Kb' );
+    logmsg( 2, '- required ', $space_required, 'Kb' );
+
+    $total_space_required += $space_required;
+}
+
+print( 'Require ', $total_space_required, 'Kb space in MySQL data area', $/ );
+
+my $disk_free = get_space();
+print( '   Have ', $disk_free, 'Kb space in MySQL data area', $/ );
+
+if ( $total_space_required >= $disk_free ) {
+    die 'FATAL: Not enough space to perform the conversion', $/;
+}
+
+if ( $options{force} ) {
+
+    my $upgrade_lock_file = Opsview::Config->upgrade_lock_file;
+    logmsg( 1, 'ODW lock file is: ', $upgrade_lock_file );
+
+    if ( -e $upgrade_lock_file ) {
+        die( 'Lock file detected - upgrade or conversion already in progress?', $/ );
+    }
+
+    # create lock file to prevent import_runtime from running
+    my $lockfile = IO::File->new( $upgrade_lock_file, 'w' ) || die 'Failed to create lockfile: ', $!, $/;
+    $lockfile->close;
+
+    foreach my $table (@tables) {
+        logmsg( 0, scalar localtime, ': ', $table );
+        $dbh->do( "ALTER TABLE " . $table . " TYPE = InnoDB" );
+    }
+    print 'Process completed at: ', scalar localtime, $/;
+
+    unlink($upgrade_lock_file);
+}
+
+exit 0;
+
+__END__
+
+=head1 NAME
+
+convert_odw_tables_to_innodb
+
+=head1 SYNOPSIS
+
+convert_odw_tables_to_innodb [-?hV] [-f]
+
+=head1 DESCRIPTION
+
+Convert ODW database MyISAM tables to use the InnoDB engine instead.  This 
+may allow for easier database backups but at the cost of higher disk usage.
+
+See http://docs.opsview.com/doku.php?id=opsview-community:odw#odw_mysql_engine_type for futher information
+
+=head1 OPTIONS
+
+=over
+
+=item --help, -?, -h
+
+Display basic help 
+
+=item --man
+
+Display man page
+
+=item --debug [0-9], --debug [--debug [...]]
+
+Enable debugging mode (using more than once increases verbosity, or specify
+a level explicitly to a maximum of level 8) 
+
+=item --version, -V
+
+Show version information
+
+=item --force, -f
+
+Actually perform the conversion
+
+NOTE: the conversion will not be started if there is not enough disk space
+to complete.  Free space required is currently set at ODW MyISAM disk usage
++ 30%.
+
+=back
+
+=head1 AUTHOR AND COPYRIGHT
+
+Copyright (C) 2003-2012 Opsview Limited. All rights reserved
+
+This is free software; you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation; either version 2 of the License, or
+(at your option) any later version.
+
+This software is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with Opsview; if not, write to the Free Software
+Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
+
+=head1 KNOWN BUGS
+
+None known at this time.
+
+=head1 SEE ALSO
+
+L<perl>
+
+=cut

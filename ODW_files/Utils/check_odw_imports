@@ -1,0 +1,69 @@
+#!/usr/bin/perl
+#
+# Authors and Copyright:
+#    Copyright (C) 2003-2012 Opsview Limited. All rights reserved
+#
+#    This is free software; you can redistribute it and/or modify
+#    it under the terms of the GNU General Public License as published by
+#    the Free Software Foundation; either version 2 of the License, or
+#    (at your option) any later version.
+#
+#    This software is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    GNU General Public License for more details.
+#
+#    You should have received a copy of the GNU General Public License
+#    along with Opsview; if not, write to the Free Software
+#    Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
+
+use warnings;
+use strict;
+use lib "/usr/local/nagios/perl/lib";
+use lib "/usr/local/nagios/lib";
+use Getopt::Std;
+use DateTime;
+use Odw;
+use Odw::Performancelabel;
+use Odw::Dataload;
+
+use Cwd;
+my ( $script, $scriptname, $scriptdir );
+( $scriptname = $0 ) =~ s!^.*/!!;
+( $scriptdir = Cwd::abs_path($0) ) =~ s!/[^/]+$!!;
+$script = "$scriptdir/$scriptname";
+
+my $odwdb = Odw->db_Main;
+
+sub datify($) { return DateTime->from_epoch( epoch => shift ); }
+
+print "Number of entries: ", Odw::Dataload->count_all, $/;
+print "First entry is: ", datify( Odw::Dataload->minimum_value_of("period_start_timev") ), $/;
+print "Last entry is: ",  datify( Odw::Dataload->maximum_value_of("period_start_timev") ), $/;
+
+my $start_range = DateTime->new(
+    year   => 2007,
+    month  => 11,
+    day    => 20,
+    hour   => 12,
+    minute => 0,
+    second => 0,
+);
+
+#my $sth=$odwdb->prepare(qq{
+#SELECT
+#});
+
+my $entries = Odw::Dataload->search( { period_start_timev => { '>', $start_range->epoch, }, } );
+
+my $current = $start_range;
+
+while ( my $row = $entries->next ) {
+
+    #	print $row->period_start_timev, $/;
+    my $diff = $row->period_start_timev->subtract_datetime($current);
+    if ( $diff->in_units('hours') > 1 ) {
+        print "Missing data around: ", $row->period_start_timev, $/;
+    }
+    $current = $row->period_start_timev;
+}

@@ -1,0 +1,91 @@
+#!/usr/bin/perl
+
+#  Copyright (C) 2003-2012 Opsview Limited. All rights reserved
+#  W: http://www.opsview.com/
+#
+#  This program is free software; you can redistribute it and/or modify
+#  it under the terms of the GNU General Public License as published by
+#  the Free Software Foundation; either version 2 of the License, or
+#  (at your option) any later version.
+#
+#  This program is distributed in the hope that it will be useful,
+#  but WITHOUT ANY WARRANTY; without even the implied warranty of
+#  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#  GNU General Public License for more details.
+#
+#  You should have received a copy of the GNU General Public License
+#  along with this program; if not, write to the Free Software
+#  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+
+use warnings;
+use strict;
+use lib '/usr/local/nagios/perl/lib', '/usr/local/nagios/lib';
+use Nagios::Plugin;
+use DateTime;
+
+my $np = Nagios::Plugin->new(
+    usage     => "Usage: %s [-t <timeout>]",
+    shortname => "AVAILABILITY",
+);
+
+$np->add_arg(
+    spec => "hostgroup=s",
+    help => "Hostgroup anywhere in hierarchy (limited to top 9)",
+);
+
+$np->add_arg(
+    spec => "warning|w=s",
+    help => "Alert if availability drops below this",
+);
+
+$np->add_arg(
+    spec => "critical|c=s",
+    help => "Alert if availability drops below this",
+);
+
+$np->getopts;
+
+my $end_time = DateTime->now->subtract( hours => 1 )->strftime("%F %H:00:00");
+my $start_time = DateTime->now->subtract( days => 7, hours => 1 )->strftime("%F %H:00:00");
+
+my $hg = $np->opts->hostgroup;
+
+require Odw;
+my $availability_percent = Odw->db_Main->selectrow_array( "
+	SELECT sum(seconds_ok)/sum(seconds_ok+seconds_not_ok)*100
+	FROM service_availability_hourly_summary,servicechecks,hosts
+	WHERE servicechecks.id = service_availability_hourly_summary.servicecheck
+	AND hosts.id = servicechecks.host
+	AND start_datetime BETWEEN ? AND ?
+	AND (hostgroup1=? OR hostgroup2=? OR hostgroup3=? OR hostgroup4=? OR hostgroup5=? 
+		OR hostgroup6=? OR hostgroup7=? OR hostgroup8=? OR hostgroup9=? 
+		OR hostgroup=?)
+	", {},
+    $start_time, $end_time,
+    $hg,
+    $hg,
+    $hg,
+    $hg,
+    $hg,
+    $hg,
+    $hg,
+    $hg,
+    $hg,
+    $hg,
+);
+
+$np->nagios_exit( CRITICAL, "Cannot get availability result" ) unless defined($availability_percent);
+
+my $threshold = $np->set_thresholds( warning => $np->opts->warning, critical => $np->opts->critical );
+
+$np->add_perfdata(
+    label     => "availability",
+    value     => $availability_percent,
+    threshold => $threshold,
+    uom       => "%",
+);
+
+$np->nagios_exit(
+    return_code => $np->check_threshold( check => $availability_percent ),
+    message     => "For '$hg' from '$start_time' to '$end_time' = $availability_percent",
+);

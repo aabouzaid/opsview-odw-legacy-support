@@ -1,0 +1,85 @@
+#!/usr/bin/perl
+
+#  Copyright (C) 2003-2012 Opsview Limited. All rights reserved
+#  W: http://www.opsview.com/
+#
+#  This program is free software; you can redistribute it and/or modify
+#  it under the terms of the GNU General Public License as published by
+#  the Free Software Foundation; either version 2 of the License, or
+#  (at your option) any later version.
+#
+#  This program is distributed in the hope that it will be useful,
+#  but WITHOUT ANY WARRANTY; without even the implied warranty of
+#  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#  GNU General Public License for more details.
+#
+#  You should have received a copy of the GNU General Public License
+#  along with this program; if not, write to the Free Software
+#  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+
+use warnings;
+use strict;
+use lib '/usr/local/nagios/perl/lib', '/usr/local/nagios/lib';
+use Nagios::Plugin;
+use DateTime;
+use Opsview::Config;
+use Opsview::Systempreference;
+
+my $VERSION = "0.02";
+
+my $np = Nagios::Plugin->new(
+    usage   => "Usage: %s [-t <timeout>] [-w <hours>] [-c <hours>]",
+    version => $VERSION,
+    blurb   => 'Check on how recently the ODW database was updated',
+);
+
+$np->add_arg(
+    spec => "warning|w=s",
+    help => qq{-w, --warning=INTEGER
+       Warning if ODW has not been updated within this many hours (default: 2)},
+    default => 2,
+);
+
+$np->add_arg(
+    spec => "critical|c=s",
+    help => qq{-c, --critical=INTEGER
+       Critical if ODW has not been updated within this many hours (default: 10) },
+    default => 10,
+);
+
+$np->getopts;
+
+alarm( $np->opts->timeout );
+
+# Check to see if ODW is enabled; if not just exit OK
+if ( !Opsview::Systempreference->enable_odw_import ) {
+    $np->nagios_exit( OK, "ODW imports are not enabled in System Preferences" );
+}
+
+# get last update in db
+require Odw::Dataload;
+my $opsview_instance_id = Opsview::Config->opsview_instance_id;
+my $last_run            = Odw::Dataload->maximum_period_end_timev($opsview_instance_id);
+unless ($last_run) {
+    $np->nagios_exit( OK, "ODW imports have never been run" );
+}
+
+# convert from time since epoc to DateTime object;
+# This is local timezone for display purposes
+my $last_time = DateTime->from_epoch( epoch => $last_run + 1, time_zone => "local" );
+
+my $start_time;
+
+$start_time = DateTime->now;
+$start_time->subtract( hours => $np->opts->critical );
+if ( DateTime->compare( $last_time, $start_time ) < 0 ) {
+    $np->nagios_exit( CRITICAL, "No update since: " . $last_time->datetime );
+}
+
+$start_time = DateTime->now;
+$start_time->subtract( hours => $np->opts->warning );
+if ( DateTime->compare( $last_time, $start_time ) < 0 ) {
+    $np->nagios_exit( WARNING, "No update since: " . $last_time->datetime );
+}
+
+$np->nagios_exit( OK, "Last updated: " . $last_time->datetime );

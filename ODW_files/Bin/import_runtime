@@ -1,0 +1,1493 @@
+#!/usr/bin/perl
+#
+#
+# SYNTAX:
+# 	import_runtime [-h] [-q] [-v] [-i iterations] [-r "YYYY-MM-DD HH"]
+#
+# DESCRIPTION:
+#	Takes data in runtime and imports into ODW, removing from runtime when finished
+#	De-normalises data, so will hold some configuration information at time of execution
+#	-r is a restart time if data is lost from runtime
+#	-i takes a number of iterations and will stop after that many. Useful for testing
+#	-q for quiet (from cron)
+#	Supports multiple Opsview masters writing to a single ODW db instance
+#	-N is a hidden option for testing. Use to set the opsview_instance_id
+#	-v is for extra verbosity when running imports
+#
+# TODO:
+#	A -r should cause state_history to have INDETERMINATE added between hours that are lost
+#
+# AUTHORS:
+#	Copyright (C) 2003-2012 Opsview Limited. All rights reserved
+#
+#    This file is part of Opsview
+#
+#    Opsview is free software; you can redistribute it and/or modify
+#    it under the terms of the GNU General Public License as published by
+#    the Free Software Foundation; either version 2 of the License, or
+#    (at your option) any later version.
+#
+#    Opsview is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    GNU General Public License for more details.
+#
+#    You should have received a copy of the GNU General Public License
+#    along with Opsview; if not, write to the Free Software
+#    Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
+#
+
+use warnings;
+use strict;
+use FindBin qw($Bin $Script);
+use lib "$Bin/../lib", "$Bin/../etc", "$Bin/../perl/lib";
+use Log::Log4perl qw(:no_extra_logdie_message);
+use Getopt::Std;
+use DateTime;
+use Odw;
+use Odw::Performancelabel;
+use Odw::Dataload;
+use Runtime;
+use Opsview;
+use Opsview::Config;
+use Opsview::Host;
+use Opsview::Performanceparsing;
+use Opsview::Systempreference;
+Opsview::Performanceparsing->init;
+use Time::Interval;
+use Statistics::Lite qw(min max sum count mean stddev stddevp);
+use Fcntl;
+use Opsview::Schema;
+
+my $schema         = Opsview::Schema->my_connect;
+my $reloadtimes_rs = $schema->resultset("Reloadtimes");
+
+sub usage;
+
+# Use a cache for service objects to save continually hits on db
+# Saves about 85% of time
+my $cache            = {};
+my $cache_host       = {};
+my $cache_perflabels = {};
+my $downtimes        = {};
+my $acknowledgements = {};
+my $notifications    = {};
+
+my $opts = {};
+getopts( "hqd:r:i:N:v", $opts ) or usage($!);
+
+usage if ( $opts->{h} );
+
+my $rootdir  = "/usr/local/nagios";
+my $log4perl = "$rootdir/etc/Log4perl.conf";
+my $pidfile  = "$rootdir/var/import_runtime.pid";
+
+Log::Log4perl::init($log4perl);
+my $logger = Log::Log4perl->get_logger("import_runtime");
+$logger->info("Starting");
+
+$SIG{__DIE__} = sub {
+    if ($^S) {
+
+        # We're in an eval {} and don't want log
+        # this message but catch it later
+        return;
+    }
+    local $Log::Log4perl::caller_depth = $Log::Log4perl::caller_depth + 1;
+    $logger->fatal(@_) if $logger;
+    die @_;    # Now terminate really
+};
+
+my $remove_pidfile = 1;
+
+END {
+    $logger->info("Finished") if $logger;
+    unlink $pidfile if $remove_pidfile;
+}
+
+# database objects
+my $runtimedb = Runtime->db_Main;
+my $odwdb     = Odw->db_Main;
+
+# database names
+my $runtime_db = Opsview::Config->runtime_db;
+
+# Multi-master instance information
+my $opsview_instance_id   = $opts->{N} || Opsview::Config->opsview_instance_id;
+my $max_object_id         = 100000000;
+my $instance_addition     = ( $max_object_id * ( $opsview_instance_id - 1 ) );
+my $object_id_range_start = $instance_addition;
+my $object_id_range_end   = $object_id_range_start + $max_object_id - 1;
+
+# Constants
+my $future_datetime = "2037-01-01 00:00:00";
+
+# Prepared statements
+my $list_keywords_for_sid_sth = $runtimedb->prepare( "
+SELECT keyword 
+FROM opsview_viewports
+WHERE object_id = ?
+ORDER BY keyword
+" );
+
+my $dataload;
+
+unless ( Opsview::Systempreference->enable_odw_import ) {
+
+    # Quietly exit if not ODW imports not enabled
+    unless ( $opts->{q} ) {
+        print "ODW importing needs to be enabled in System Preferences\n";
+    }
+    exit;
+}
+
+my $upgrade_lock_file = Opsview::Config->upgrade_lock_file;
+if ( -e $upgrade_lock_file ) {
+    my $message = "Upgrade seems to still be in progress - check why $upgrade_lock_file still exists";
+    if ( $opts->{v} ) {
+        print $message, $/;
+    }
+    $logger->logdie($message);
+}
+
+# Check for lock file
+# If exists, read pid. If pid does not exist, assume finished and run cleanup. If pid does exist, print message and exit
+my $fh;
+my $c = 0;
+unless ( sysopen( $fh, $pidfile, O_WRONLY | O_EXCL | O_CREAT ) ) {
+    $logger->error("Lock file already exists");
+    if ( open $fh, $pidfile ) {
+        my $pid = <$fh>;
+        $logger->error("Pid file found with pid $pid");
+        if ( kill 0, $pid ) {
+            $logger->error("Process $pid currently running - exiting quietly");
+            $remove_pidfile = 0;
+            exit;
+        }
+        else {
+            $logger->error("Process $pid does not exist - cleaning up");
+            unlink $pidfile;
+            system("/usr/local/nagios/bin/cleanup_import");
+            unless ( sysopen( $fh, $pidfile, O_WRONLY | O_EXCL | O_CREAT ) ) {
+                $logger->logdie("Still cannot get lock after cleanup");
+            }
+            $logger->info("Cleanup successful - continuing");
+        }
+    }
+    else {
+        $logger->logdie("Lock file exists, but cannot read it: $!");
+    }
+}
+print $fh $$;
+close $fh;
+
+if ( my ($found) = Odw::Dataload->search( opsview_instance_id => $opsview_instance_id, status => "running" ) ) {
+    $logger->logdie("There are running dataloads - exiting");
+}
+if ( my ($found) = Odw::Dataload->search( opsview_instance_id => $opsview_instance_id, status => "failed" ) ) {
+    $logger->logdie("There are failed dataloads - exiting");
+}
+
+if ( $opts->{d} ) {
+    $logger->logdie("-d is no longer supported - running import_runtime for the first time will automatically calculate from the earliest possible time");
+}
+
+my $iterations = $opts->{i} || 0;    # 0 means keep going
+
+my $full_odw_import = Opsview::Systempreference->enable_full_odw_import;
+
+# Set hour that we are looking at
+my $start_dt;
+my $start_timev;
+my $extra_runs     = 0;
+my $first_ever_run = 0;
+my $earliest_time  = $opts->{r};
+unless ( defined $earliest_time ) {
+    my $last_timev = Odw::Dataload->maximum_period_end_timev($opsview_instance_id);
+    if ($last_timev) {
+        $start_dt = DateTime->from_epoch( epoch => $last_timev + 1, time_zone => "UTC" );
+    }
+    else {
+        $earliest_time = $runtimedb->selectrow_array("SELECT DATE_FORMAT(CONVERT_TZ(MIN(start_time) + INTERVAL 1 HOUR, '+00:00', 'SYSTEM'), '%Y-%m-%d %H') FROM nagios_servicechecks");
+        unless ($earliest_time) {
+            $logger->logdie("No data in runtime - is nagios running yet?");
+        }
+        $first_ever_run = 1;
+    }
+}
+
+if ($earliest_time) {
+    my ( $year, $mon, $day, $hour ) = ( $earliest_time =~ /^(\d\d\d\d)-(\d\d)-(\d\d) (\d\d)$/ );
+    unless ( defined $hour ) {
+        $logger->logdie("Must specify a starting hour of format 'YYYY-MM-DD HH'\n");
+    }
+
+    # TODO: Need some processing here to select dates
+    # This input is expecting local times, so convert from local to UTC afterwards
+    $start_dt = DateTime->new(
+        year      => $year,
+        month     => $mon,
+        day       => $day,
+        hour      => $hour,
+        minute    => 0,
+        second    => 0,
+        time_zone => "local",
+    );
+    $start_dt->set_time_zone("UTC");
+}
+
+# Check for external lock
+if ( $odwdb->selectrow_array("SELECT value FROM locks WHERE name='import_disabled'") ) {
+    print "Import ignored for now\n";
+    exit;
+}
+
+# Main loop
+MAIN_LOOP:
+while (1) {
+
+    my $end_dt = $start_dt->clone->add( minutes => 59, seconds => 59 );
+    my $next_dt              = $end_dt->clone->add( seconds => 1 );
+    my $start_datetime       = $start_dt->strftime("%F %T");
+    my $start_datetime_local = $start_dt->clone->set_time_zone("local");
+    $start_datetime_local = $start_datetime_local->strftime("%F %T");
+    my $next_datetime = $next_dt->strftime("%F %T");
+    my $end_datetime  = $end_dt->strftime("%F %T");
+    my $end_timev     = $end_dt->epoch;
+    $start_timev = $start_dt->epoch;
+
+    my $runtime_update_timev;
+
+    my $retry_timeout = 60;    # number of seconds to keep trying this check
+    while ( !( $runtime_update_timev = $runtimedb->selectrow_array("SELECT UNIX_TIMESTAMP(status_update_time) FROM nagios_programstatus") ) ) {
+
+        $logger->logwarn( 'Waiting on status_update_time to be populated in nagios_programstatus (timeout in ', $retry_timeout, ' seconds)', $/ );
+
+        # This value could be NULL sometimes, usually if caught during a reload
+        sleep 10;
+        $retry_timeout -= 10;
+        if ( $retry_timeout <= 0 ) {
+            $logger->logwarn( 'Problem trying to access status_update_time in nagios_programstatus; will retry later', $/ );
+            last MAIN_LOOP;
+        }
+    }
+
+    if ( $runtime_update_timev < $end_timev ) {
+        if ($extra_runs) {
+
+            # Normal exit
+            last MAIN_LOOP;
+        }
+        print "Last update to DB is " . DateTime->from_epoch( epoch => $runtime_update_timev, time_zone => "local" )->strftime("%F %T") . ". Cannot run until after " . $end_dt->set_time_zone("local")->strftime("%F %T"), $/;
+        exit 1;
+    }
+    if ( $runtime_update_timev - $end_timev < 60 ) {
+        if ($extra_runs) {
+
+            # Normal exit
+            last MAIN_LOOP;
+        }
+        else {
+
+            # Need to allow time for NDO to update rows in nagios_servicechecks
+            print "Cannot run within 60 seconds of end time", $/;
+            exit 1;
+        }
+    }
+
+    if ( !$opts->{q} ) {
+        print "Running for $start_datetime_local";
+        if ( $opts->{v} ) {
+            print ' - started at ', scalar(localtime);
+        }
+        print $/ ;
+    }
+
+    $logger->info("Importing for $start_datetime");
+    my $num_hosts          = {};
+    my $num_services       = {};
+    my $num_serviceresults = 0;
+    my $num_perfdata       = 0;
+
+    my $load_start_timev = time();
+
+    my $dataload = Odw::Dataload->insert(
+        {   opsview_instance_id => $opsview_instance_id,
+            period_start_timev  => $start_timev,
+            period_end_timev    => $end_timev,
+            load_start_timev    => $load_start_timev,
+            status              => "running",
+        }
+    );
+    $logger->logdie("Error creating dataload") unless $dataload;
+
+    my $sth;
+
+    my @values;
+    my $do_large_perfdata_insert = sub {
+        my $force = shift;
+        if ( ( scalar @values >= 1000 ) || ( $force && @values ) ) {
+            $odwdb->do( "INSERT INTO performance_data (datetime, performance_label, value) VALUES " . join( ",", @values ) );
+            @values = ();
+        }
+    };
+
+    my @sc_results;
+    my $do_large_sc_insert = sub {
+        my $force = shift;
+
+        # Choose 50 because don't want to have more than 1 megabyte of data in one query
+        if ( ( ( my $vals = scalar @sc_results / 8 ) >= 50 ) || ( $force && @sc_results ) ) {
+            $odwdb->do(
+                "INSERT INTO servicecheck_results
+            (start_datetime, start_datetime_usec, servicecheck, check_type, status, status_type, duration, output)
+            VALUES " . ( join ',', ("(?,?,?,?,?,?,?,?)") x $vals ), {}, @sc_results
+            );
+            @sc_results = ();
+        }
+    };
+
+    # Read in servicechecks and grab performance data
+    my $perfdata_cache           = {};
+    my $last_odw_servicecheck_id = 0;
+    $logger->info("Importing all results and performance data");
+    $sth = $runtimedb->prepare( "
+SELECT service_object_id, state, state_type, perfdata, output, start_time, start_time_usec, check_type, execution_time
+FROM nagios_servicechecks 
+WHERE start_time BETWEEN '$start_datetime' AND '$end_datetime'
+ORDER BY service_object_id, start_time
+" );
+    $sth->execute;
+    while ( my ( $sid, $state, $state_type, $perfdata, $output, $service_start_time, $service_start_time_usec, $check_type, $duration ) = $sth->fetchrow_array ) {
+
+        $_ = get_odw_objects($sid);
+        my $odw_host         = $_->{odw_host_object};
+        my $odw_servicecheck = $_->{odw_service_object};
+
+        $num_hosts->{ $odw_host->id }            = 1;
+        $num_services->{ $odw_servicecheck->id } = 1;
+
+        # For every new service object, reset cache
+        if ( $last_odw_servicecheck_id != $odw_servicecheck->id ) {
+            if ($last_odw_servicecheck_id) {
+                insert_summarised_perfdata( $start_datetime, $perfdata_cache );
+            }
+            $perfdata_cache           = {};
+            $last_odw_servicecheck_id = $odw_servicecheck->id;
+        }
+
+        if ($full_odw_import) {
+            push @sc_results, $service_start_time, $service_start_time_usec, $odw_servicecheck->id, convert_check_type_to_text($check_type), convert_state_to_text($state), convert_state_type_to_text($state_type), $duration, $output;
+        }
+
+        #
+        # Parse perfdata using Opsview::Performanceparsing
+        # which is a wrapper to Nagios::Plugin::Performance and nagiosgraph's map file logic
+        #
+
+        my $perfs = Opsview::Performanceparsing->parseperfdata( servicename => $odw_servicecheck->name, output => $output, perfdata => $perfdata );
+        foreach my $p (@$perfs) {
+            next if ( $p->value eq "U" );    # Ignore unknown values
+            my $odw_perflabel_id = get_odw_perf_label( $odw_host->id, $odw_servicecheck->id, $p->label, $p->uom );
+
+            push @{ $perfdata_cache->{$odw_perflabel_id} }, $p->value;
+
+            if ($full_odw_import) {
+                push @values, "('$service_start_time',$odw_perflabel_id," . $p->value . ")";
+            }
+
+            $num_perfdata++;
+        }
+        $do_large_sc_insert->();
+        $do_large_perfdata_insert->();
+        $num_serviceresults++;
+    }
+    $do_large_sc_insert->(1);
+    $do_large_perfdata_insert->(1);
+    insert_summarised_perfdata( $start_datetime, $perfdata_cache );
+
+    # Only required on a first ever run
+    # For each activated servicecheck, set an initial state_history of the last state
+    # seen in nagios_statehistory/nagios_servicechecks at import start time.
+    # The prior state is the same, with a time of that point
+    if ($first_ever_run) {
+        $logger->info("Calculating initial states");
+        $sth = $runtimedb->prepare( "
+	SELECT object_id
+	FROM nagios_objects
+	WHERE is_active = 1
+	AND objecttype_id = 2
+	" );
+        $sth->execute;
+        while ( my $object_id = $sth->fetchrow_array ) {
+
+            my ( $initial_status_datetime, $initial_status, $initial_status_type ) = find_initial_service_state( $object_id, $start_datetime );
+            unless ( defined $initial_status ) {
+
+                # There is no data for this service at start_datetime so can't have been running at start_time
+                # This could happen with a service that starts in the middle of an hour
+                next;
+            }
+            $_ = get_odw_objects($object_id);
+            my $odw_servicecheck = $_->{odw_service_object};
+
+            $odwdb->do(
+                "INSERT INTO state_history
+			(datetime, datetime_usec, 
+			servicecheck, 
+			status, status_type, 
+			prior_status_datetime, prior_status, output)
+			VALUES
+			(?, ?, ?, ?, ?, ?, ?, ?)",
+                {},
+                $start_datetime, 0,
+                $odw_servicecheck->id,
+                convert_state_to_text($initial_status),
+                $initial_status == 0 ? "HARD" : convert_state_type_to_text($initial_status_type),
+                $initial_status_datetime,
+                convert_state_to_text($initial_status),
+                "First state on initial import",
+            );
+
+            $odwdb->do(
+                "INSERT INTO service_saved_state
+			(start_timev, hostname, servicename, last_state, last_hard_state, acknowledged, opsview_instance_id)
+			VALUES
+			(?, ?, ?, ?, ?, ?, ?)",
+                {},
+                $start_timev,
+                $odw_servicecheck->hostname,
+                $odw_servicecheck->name,
+                convert_state_to_text($initial_status),
+                convert_state_to_text($initial_status),    # TODO: Not always true, but close enough
+                $initial_status == 0 ? 0 : 1,              # Assume all failed things are acknowledged on first start
+                $opsview_instance_id,
+            );
+        }
+    }
+
+    # Save downtime start data into ODW
+    # Separate hosts and services tables
+    # Only save downtimes that have an actual_start_time beginning in this hour
+    $logger->info("Importing downtime starts");
+    $sth = $runtimedb->prepare( "
+SELECT downtime_type, object_id, entry_time, author_name, comment_data, is_fixed, duration, scheduled_start_time,
+ scheduled_end_time, was_started, actual_start_time, actual_end_time, was_cancelled, internal_downtime_id
+FROM nagios_downtimehistory
+WHERE actual_start_time BETWEEN '$start_datetime' AND '$end_datetime'
+ORDER BY object_id
+" );
+    $sth->execute;
+    while ( my $row = $sth->fetchrow_hashref ) {
+        my ( $odw_object_id, $tablename );
+
+        # For services
+        if ( $row->{downtime_type} == 1 ) {
+            $tablename = "downtime_service_history";
+
+            # Even though $odw_object_id is not used, let this go
+            # because will confirm object has been created
+            $_             = get_odw_objects( $row->{object_id} );
+            $odw_object_id = $_->{odw_service_object};
+        }
+        else {
+            $tablename     = "downtime_host_history";
+            $odw_object_id = get_odw_host_object( $row->{object_id} );
+        }
+
+        # If the object is not found in ODW, we ignore this downtime. This is possible if
+        # an object is created and renamed before import_runtime runs
+        next if ( $odw_object_id->id == 1 );
+
+        my $actual_end_datetime;
+
+        # If the end time has not been set, we set it to a date in the future
+        # This will be reduced down to the actual_end_datetime when downtime finishes
+        if ( $row->{actual_end_time} eq "0000-00-00 00:00:00" ) {
+
+            # Can't be higher because of perl's intepretation of date
+            $actual_end_datetime = $future_datetime;
+        }
+        else {
+            $actual_end_datetime = $row->{actual_end_time};
+        }
+        my $nagios_object_id_multi_master = $row->{object_id} + $instance_addition;
+
+        # We check to see if there already is a downtime of this value set
+        my $found = $odwdb->selectrow_array(
+            "SELECT COUNT(*) FROM $tablename
+		WHERE actual_start_datetime=? AND nagios_object_id = ?",
+            {},
+            $row->{actual_start_time},
+            $nagios_object_id_multi_master,
+        );
+        if ( !$found ) {
+            $odwdb->do(
+                "INSERT INTO $tablename 
+			(actual_start_datetime, actual_end_datetime, nagios_object_id,
+			author_name, comment_data, entry_datetime, 
+			scheduled_start_datetime, scheduled_end_datetime, 
+			is_fixed, duration, was_cancelled, nagios_internal_downtime_id)
+			VALUES
+			(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                {},
+                $row->{actual_start_time},    $actual_end_datetime, $nagios_object_id_multi_master,
+                $row->{author_name},          $row->{comment_data}, $row->{entry_time},
+                $row->{scheduled_start_time}, $row->{scheduled_end_time},
+                $row->{is_fixed},             $row->{duration},     $row->{was_cancelled},
+                $row->{internal_downtime_id},
+            );
+        }
+    }
+
+    # Save downtime end data
+    # Can ignore actual_start_times before $start_datetime because will be caught by above
+    # Some rows will be copied again, eg, if import_runtime is run over two hours where start
+    # is in one hour and end in another. This is not a problem
+    $logger->info("Importing downtime ends");
+    $sth = $runtimedb->prepare( "
+SELECT actual_start_time, actual_end_time, downtime_type, object_id, duration, was_cancelled, internal_downtime_id
+FROM nagios_downtimehistory
+WHERE actual_end_time BETWEEN '$start_datetime' AND '$end_datetime' AND actual_start_time < '$start_datetime'
+ORDER BY object_id
+" );
+    $sth->execute;
+    while ( my $row = $sth->fetchrow_hashref ) {
+        my ( $odw_object_id, $tablename );
+
+        if ( $row->{downtime_type} == 1 ) {
+            $tablename     = "downtime_service_history";
+            $_             = get_odw_objects( $row->{object_id} );
+            $odw_object_id = $_->{odw_service_object};
+        }
+        else {
+            $tablename     = "downtime_host_history";
+            $odw_object_id = get_odw_host_object( $row->{object_id} );
+        }
+
+        my $nagios_object_id_multi_master = $row->{object_id} + $instance_addition;
+
+        # As nagios_internal_downtime_id could be duplicated across multi-masters, also use the (multi-master) nagios_object_id
+        # Also limit based on the actual_start_time because have seen instances where NDO puts a nagios_internal_downtime_id as 1
+        # multiple times. This means that some downtime is incorrectly set
+        $odwdb->do(
+            "UPDATE $tablename 
+		SET actual_end_datetime=?, duration=?, was_cancelled=?
+		WHERE nagios_internal_downtime_id = ?
+		AND actual_start_datetime = ?
+		AND nagios_object_id = ?",
+            {},
+            $row->{actual_end_time},
+            $row->{duration},
+            $row->{was_cancelled},
+            $row->{internal_downtime_id},
+            $row->{actual_start_time},
+            $nagios_object_id_multi_master,
+        );
+    }
+
+    # Fix possible issue where actual_downtime_end is not set correctly
+    $logger->info("Checking for incorrect downtimes");
+    fix_nonending_downtimes( $end_datetime, "downtime_service_history" );
+    fix_nonending_downtimes( $end_datetime, "downtime_host_history" );
+
+    # Get a hash of all downtimes that could be relevant for this period
+    # $downtimes is a hash, indexed by the (multi-master) nagios_object_id. Need to use this, and not the odw ids because
+    # the host/service configuration could change over the duration of the downtime, but the nagios_object_id will remain constant
+    $logger->info("Caculating relevant downtimes");
+    $downtimes = {};
+
+    # We have to order this by actual_start_datetime so that we can check for overlapping downtimes
+    $sth = $odwdb->prepare( "
+SELECT nagios_object_id, UNIX_TIMESTAMP(actual_start_datetime), UNIX_TIMESTAMP(actual_end_datetime)
+FROM downtime_service_history
+WHERE 
+(
+ (actual_start_datetime <= '$start_datetime' AND actual_end_datetime >= '$end_datetime')
+ OR
+ (actual_start_datetime <= '$start_datetime' AND actual_end_datetime BETWEEN '$start_datetime' AND '$end_datetime')
+ OR
+ (actual_start_datetime BETWEEN '$start_datetime' AND '$end_datetime' AND actual_end_datetime BETWEEN '$start_datetime' AND '$end_datetime')
+ OR
+ (actual_start_datetime BETWEEN '$start_datetime' AND '$end_datetime' AND actual_end_datetime >= '$end_datetime')
+)
+ORDER BY actual_start_datetime
+" );
+    $sth->execute;
+    while ( my ( $nagios_object_id, $actual_start_timev, $actual_end_timev ) = $sth->fetchrow_array ) {
+        push @{ $downtimes->{$nagios_object_id} }, { actual_start_timev => $actual_start_timev, actual_end_timev => $actual_end_timev };
+    }
+
+    $sth = $odwdb->prepare( "
+SELECT nagios_object_id, UNIX_TIMESTAMP(actual_start_datetime), UNIX_TIMESTAMP(actual_end_datetime)
+FROM downtime_host_history
+WHERE 
+(
+ (actual_start_datetime <= '$start_datetime' AND actual_end_datetime >= '$end_datetime')
+ OR
+ (actual_start_datetime <= '$start_datetime' AND actual_end_datetime BETWEEN '$start_datetime' AND '$end_datetime')
+ OR
+ (actual_start_datetime BETWEEN '$start_datetime' AND '$end_datetime' AND actual_end_datetime BETWEEN '$start_datetime' AND '$end_datetime')
+ OR
+ (actual_start_datetime BETWEEN '$start_datetime' AND '$end_datetime' AND actual_end_datetime >= '$end_datetime')
+)
+" );
+    $sth->execute;
+    while ( my ( $nagios_object_id, $actual_start_timev, $actual_end_timev ) = $sth->fetchrow_array ) {
+        push @{ $downtimes->{$nagios_object_id} }, { actual_start_timev => $actual_start_timev, actual_end_timev => $actual_end_timev };
+    }
+
+    # Save notification data
+    # Seperate hosts and services tables
+    # Also saved into a hash for later use if required
+    $logger->info("Importing notifications");
+    $notifications = {};
+    $sth           = $runtimedb->prepare( "
+SELECT
+	nn.start_time as time,
+	UNIX_TIMESTAMP(nn.start_time) AS timev,
+	notification_type,
+	nn.object_id,
+	nn.state as state,
+	nn.output as output,
+	notification_reason,
+	notification_number,
+	nc.alias as contact_name,
+	no.name1 as command_name
+FROM 
+	nagios_notifications nn,
+	nagios_contactnotifications ncn,
+	nagios_contacts nc,
+	nagios_contactnotificationmethods ncnm,
+	nagios_objects no
+WHERE nn.notification_id = ncn.notification_id
+AND ncn.contact_object_id = nc.contact_object_id
+AND ncn.contactnotification_id = ncnm.contactnotification_id
+AND ncnm.command_object_id = no.object_id
+AND nn.start_time BETWEEN '$start_datetime' AND '$end_datetime'
+ORDER BY nn.notification_id
+" );
+    $sth->execute;
+    while ( my $row = $sth->fetchrow_hashref ) {
+        my ( $odw_object_id, $tablename, $columnname, $status );
+
+        if ( $row->{notification_type} == 1 ) {
+            $tablename     = "notification_service_history";
+            $columnname    = "service";
+            $_             = get_odw_objects( $row->{object_id} );
+            $odw_object_id = $_->{odw_service_object};
+            $status        = convert_state_to_text( $row->{state} );
+        }
+        else {
+            $tablename     = "notification_host_history";
+            $columnname    = "host";
+            $odw_object_id = get_odw_host_object( $row->{object_id} );
+            $status        = convert_host_state_to_text( $row->{state} );
+        }
+
+        push @{ $notifications->{$columnname}->{ $odw_object_id->id } }, { entry_timev => $row->{entry_timev} };
+
+        my $methodname = $row->{command_name};
+        $methodname =~ s/^((service|host)-)?notify-by-//;
+
+        my $reason = convert_notification_reason_to_text( $row->{notification_reason} );
+
+        $odwdb->do(
+            "INSERT INTO $tablename 
+		(entry_datetime, $columnname, status, output,
+		notification_reason, notification_number,
+		contactname, methodname)
+		VALUES
+		(?, ?, ?, ?, ?, ?, ?, ?)",
+            {},
+            $row->{time},
+            $odw_object_id->id,
+            $status,
+            $row->{output},
+            $reason,
+            $row->{notification_number},
+            $row->{contact_name},
+            $methodname,
+        );
+    }
+
+    # Save acknowledgement data
+    # Separate hosts and services tables
+    # Also, saved into a hash for later lookup
+    $logger->info("Importing acknowledgements");
+    $acknowledgements = {};
+    $sth              = $runtimedb->prepare( "
+SELECT entry_time, UNIX_TIMESTAMP(entry_time) AS entry_timev,
+acknowledgement_type, object_id, author_name, comment_data, is_sticky, persistent_comment, notify_contacts
+FROM nagios_acknowledgements
+WHERE entry_time BETWEEN '$start_datetime' AND '$end_datetime'
+ORDER BY object_id
+" );
+    $sth->execute;
+    while ( my $row = $sth->fetchrow_hashref ) {
+        my ( $odw_object_id, $tablename, $columnname );
+
+        if ( $row->{acknowledgement_type} == 1 ) {
+            $tablename     = "acknowledgement_service";
+            $columnname    = "service";
+            $_             = get_odw_objects( $row->{object_id} );
+            $odw_object_id = $_->{odw_service_object};
+        }
+        else {
+            $tablename     = "acknowledgement_host";
+            $columnname    = "host";
+            $odw_object_id = get_odw_host_object( $row->{object_id} );
+        }
+
+        push @{ $acknowledgements->{$columnname}->{ $odw_object_id->id } }, { entry_timev => $row->{entry_timev} };
+
+        $odwdb->do(
+            "INSERT INTO $tablename 
+		(entry_datetime, $columnname, 
+		author_name, comment_data, 
+		is_sticky, persistent_comment, notify_contacts)
+		VALUES
+		(?, ?, ?, ?, ?, ?, ?)",
+            {},
+            $row->{entry_time},
+            $odw_object_id->id,
+            $row->{author_name},
+            $row->{comment_data},
+            $row->{is_sticky},
+            $row->{persistent_comment},
+            $row->{notify_contacts},
+        );
+    }
+
+    # Save state_history - only for services
+    # Add two extra columns to store the prior states. This helps speed up queries for availability
+    # If a prior state is not found, then assumes OK - this would happen with new services
+    $logger->info("Importing state history");
+    my ( $prior_status_datetime, $prior_status, $last_object_id, $odw_servicecheck );
+
+    # Must order by object_id, state_time for the last_object_id bit to work
+    $sth = $runtimedb->prepare( "
+SELECT sh.object_id as object_id, state, state_type, state_time, state_time_usec, output
+FROM nagios_statehistory sh, nagios_objects o
+WHERE sh.object_id = o.object_id
+AND o.objecttype_id = 2
+AND state_time BETWEEN '$start_datetime' AND '$end_datetime'
+ORDER BY object_id, state_time
+" );
+
+    $sth->execute;
+    while ( my ( $object_id, $state, $state_type, $service_start_time, $service_start_time_usec, $output ) = $sth->fetchrow_array ) {
+        if ( !defined $last_object_id || $last_object_id != $object_id ) {
+            $_                = get_odw_objects($object_id);
+            $odw_servicecheck = $_->{odw_service_object};
+
+            ( $prior_status_datetime, $prior_status ) = $odwdb->selectrow_array( "
+			SELECT datetime,status FROM state_history
+			WHERE datetime <= '$start_datetime' AND servicecheck=" . $odw_servicecheck->id . "
+			ORDER BY datetime DESC LIMIT 1
+		" );
+
+            # This service could have changed its primary key due to configuration changes
+            unless ($prior_status) {
+                my ( $hostname, $servicename ) = $odwdb->selectrow_array( "SELECT hostname, name FROM servicechecks WHERE id=?", {}, $odw_servicecheck->id );
+                my $count = $odwdb->selectrow_array( "SELECT COUNT(*) FROM servicechecks WHERE hostname = ? AND name = ? AND id < ?", {}, $hostname, $servicename, $odw_servicecheck->id );
+                if ( $count > 0 ) {
+                    ( $prior_status_datetime, $prior_status ) = $odwdb->selectrow_array( "
+SELECT datetime, status
+FROM state_history, servicechecks
+WHERE state_history.servicecheck=servicechecks.id
+ AND servicechecks.hostname=?
+ AND servicechecks.name=?
+ AND servicechecks.id < ?
+ AND state_history.datetime < ?
+ORDER BY datetime DESC
+LIMIT 1
+", {}, $hostname, $servicename, $odw_servicecheck->id, $service_start_time );
+                }
+            }
+
+            # This is a new service that has just appeared
+            # Set prior state to current data
+            unless ($prior_status) {
+                $prior_status          = convert_state_to_text($state);
+                $prior_status_datetime = $service_start_time;
+            }
+        }
+
+        my $current_state = convert_state_to_text($state);
+        my $current_state_type;
+
+        # Nagios will put an OK state into SOFT if it recovers from a soft failure
+        # We force ODW to be in a hard state for OK
+        if ( $state == 0 ) {
+            $current_state_type = "HARD";
+        }
+        else {
+            $current_state_type = convert_state_type_to_text($state_type);
+        }
+        $odwdb->do(
+            "INSERT INTO state_history 
+		(datetime, datetime_usec, servicecheck, 
+		status, status_type, 
+		prior_status_datetime, prior_status, output)
+		VALUES
+		(?, ?, ?, ?, ?, ?, ?, ?)",
+            {},
+            $service_start_time,    $service_start_time_usec, $odw_servicecheck->id,
+            $current_state,         $current_state_type,
+            $prior_status_datetime, $prior_status,
+            $output,
+        );
+
+        $prior_status          = $current_state;        # Save timings for next run
+        $prior_status_datetime = $service_start_time;
+        $last_object_id        = $object_id;
+    }
+
+    # For each servicecheck, find the state at the top of the hour
+    # by backtracking through state_history table.
+    # Then progressively see what state changes have occurred, keeping a running total of
+    # seconds in each state
+    # Only uses state_history to gather information
+    # I wonder if this is easier to do with DateTime::Sets? Could create sets of time intervals
+    # and work out intersections and unions to calculate timings of things.
+    $logger->info("Calculating hourly availability");
+    $sth = $runtimedb->prepare( "
+SELECT object_id
+FROM nagios_objects
+WHERE is_active = 1
+AND objecttype_id = 2
+" );
+    $sth->execute;
+    while ( my $object_id = $sth->fetchrow_array ) {
+
+        $_ = get_odw_objects($object_id);
+        my $odw_servicecheck    = $_->{odw_service_object};
+        my $odw_host            = $_->{odw_host_object};
+        my $odw_host_id         = $odw_host->id;
+        my $odw_servicecheck_id = $odw_servicecheck->id;
+
+        my $last_timev                 = $start_timev;
+        my %state_seconds              = ( INDETERMINATE => 0, OK => 0, WARNING => 0, CRITICAL => 0, UNKNOWN => 0 );
+        my %state_hard_seconds         = ( INDETERMINATE => 0, OK => 0, WARNING => 0, CRITICAL => 0, UNKNOWN => 0 );
+        my $seconds_not_ok_scheduled   = 0;
+        my $seconds_warning_scheduled  = 0;
+        my $seconds_critical_scheduled = 0;
+        my $seconds_unknown_scheduled  = 0;
+        my $seconds_unacknowledged     = 0;
+
+        my ( $last_state, $last_hard_state, $problem_has_been_acknowledged ) = $odwdb->selectrow_array( "
+		SELECT last_state, last_hard_state, acknowledged 
+		FROM service_saved_state 
+		WHERE start_timev = ? AND hostname = ? AND servicename = ?",
+            {},
+            $start_timev,
+            $odw_servicecheck->hostname,
+            $odw_servicecheck->name,
+        );
+        unless ( defined $last_state ) {
+
+            # For things that have not had saved statuses (like new hosts, services, or an upgrade from an older ODW),
+            # try and query Runtime for info
+            # Most of the time, the service_saved_state should have the information required
+            my ( $initial_status_datetime, $initial_status, $initial_status_type ) = find_initial_service_state( $object_id, $start_datetime );
+            if ( defined $initial_status ) {
+                $last_state = convert_state_to_text($initial_status), $last_hard_state = convert_state_to_text($initial_status),;
+            }
+            else {
+
+                # Set default values
+                $last_state      = "INDETERMINATE";
+                $last_hard_state = "INDETERMINATE";
+            }
+
+            # For these, impossible to know if an acknowledgement has been set, so assume has been done
+            $problem_has_been_acknowledged = 1;
+        }
+
+        my $changes = $odwdb->prepare( "
+		SELECT UNIX_TIMESTAMP(datetime) as state_timev, status, status_type 
+		FROM state_history
+		WHERE servicecheck = $odw_servicecheck_id AND datetime BETWEEN '$start_datetime' AND '$end_datetime'
+		ORDER BY datetime
+		" );
+        $changes->execute;
+        while ( my ( $new_state_timev, $state, $state_type ) = $changes->fetchrow_array ) {
+
+            $state_seconds{$last_state}           += ( $new_state_timev - $last_timev );
+            $state_hard_seconds{$last_hard_state} += ( $new_state_timev - $last_timev );
+
+            if ( $last_state ne "OK" ) {
+                my ( $seconds_elapsed_not_ok_scheduled, $end_downtime ) = calculate_downtime_seconds( $last_timev, $new_state_timev, $odw_servicecheck->nagios_object_id, $odw_host->nagios_object_id );
+                $seconds_not_ok_scheduled += $seconds_elapsed_not_ok_scheduled;
+                if ( $last_state eq "WARNING" ) {
+                    $seconds_warning_scheduled += $seconds_elapsed_not_ok_scheduled;
+                }
+                elsif ( $last_state eq "CRITICAL" ) {
+                    $seconds_critical_scheduled += $seconds_elapsed_not_ok_scheduled;
+                }
+                elsif ( $last_state eq "UNKNOWN" ) {
+                    $seconds_unknown_scheduled += $seconds_elapsed_not_ok_scheduled;
+                }
+                unless ($problem_has_been_acknowledged) {
+                    my ( $seconds_elapsed_unacknowledged, $acknowledgement_found ) = calculate_acknowledged_seconds( $end_downtime, $new_state_timev, $last_hard_state, $odw_servicecheck_id, $odw_host_id );
+                    $seconds_unacknowledged += $seconds_elapsed_unacknowledged;
+                    $problem_has_been_acknowledged = 1 if $acknowledgement_found;
+                }
+            }
+
+            if ( $state_type eq "HARD" ) {
+                $last_hard_state = $state;
+            }
+            if ( $state eq "OK" ) {
+                $problem_has_been_acknowledged = 0;
+            }
+            $last_state = $state;
+            $last_timev = $new_state_timev;
+        }
+
+        $state_seconds{$last_state}           += ( $end_timev - $last_timev ) + 1;
+        $state_hard_seconds{$last_hard_state} += ( $end_timev - $last_timev ) + 1;
+        if ( $last_state ne "OK" ) {
+            my ( $seconds_elapsed_not_ok_scheduled, $end_downtime ) = calculate_downtime_seconds( $last_timev, $end_timev + 1, $odw_servicecheck->nagios_object_id, $odw_host->nagios_object_id );
+            $seconds_not_ok_scheduled += $seconds_elapsed_not_ok_scheduled;
+            if ( $last_state eq "WARNING" ) {
+                $seconds_warning_scheduled += $seconds_elapsed_not_ok_scheduled;
+            }
+            elsif ( $last_state eq "CRITICAL" ) {
+                $seconds_critical_scheduled += $seconds_elapsed_not_ok_scheduled;
+            }
+            elsif ( $last_state eq "UNKNOWN" ) {
+                $seconds_unknown_scheduled += $seconds_elapsed_not_ok_scheduled;
+            }
+            unless ($problem_has_been_acknowledged) {
+                my ( $seconds_elapsed_unacknowledged, $acknowledgement_found ) = calculate_acknowledged_seconds( $end_downtime, $end_timev + 1, $last_hard_state, $odw_servicecheck_id, $odw_host_id );
+                $seconds_unacknowledged += $seconds_elapsed_unacknowledged;
+                $problem_has_been_acknowledged = 1 if $acknowledgement_found;
+            }
+        }
+
+        # Ignore services that have not had a result at all
+        next if ( $state_seconds{INDETERMINATE} == 3600 );
+
+        $odwdb->do(
+            "INSERT INTO service_availability_hourly_summary
+		(start_datetime, servicecheck, seconds_ok, seconds_not_ok, seconds_warning, seconds_critical, seconds_unknown,
+		seconds_not_ok_hard, seconds_warning_hard, seconds_critical_hard, seconds_unknown_hard, 
+		seconds_not_ok_scheduled, 
+		seconds_warning_scheduled, seconds_critical_scheduled, seconds_unknown_scheduled,
+		seconds_unacknowledged)
+		VALUES
+		(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", {},
+            $start_datetime,
+            $odw_servicecheck_id,
+            $state_seconds{OK}                                                                          || 0,
+            $state_seconds{WARNING} + $state_seconds{CRITICAL} + $state_seconds{UNKNOWN}                || 0,
+            $state_seconds{WARNING}                                                                     || 0,
+            $state_seconds{CRITICAL}                                                                    || 0,
+            $state_seconds{UNKNOWN}                                                                     || 0,
+            $state_hard_seconds{WARNING} + $state_hard_seconds{CRITICAL} + $state_hard_seconds{UNKNOWN} || 0,
+            $state_hard_seconds{WARNING}                                                                || 0,
+            $state_hard_seconds{CRITICAL}                                                               || 0,
+            $state_hard_seconds{UNKNOWN}                                                                || 0,
+            $seconds_not_ok_scheduled,
+            $seconds_warning_scheduled,
+            $seconds_critical_scheduled,
+            $seconds_unknown_scheduled,
+            $seconds_unacknowledged,
+        );
+        $odwdb->do(
+            "INSERT INTO service_saved_state
+		(start_timev, hostname, servicename, last_state, last_hard_state, acknowledged, opsview_instance_id)
+		VALUES
+		(?, ?, ?, ?, ?, ?, ?)",
+            {},
+            $start_timev + 3600,
+            $odw_servicecheck->hostname,
+            $odw_servicecheck->name,
+            $last_state,
+            $last_hard_state,
+            $problem_has_been_acknowledged,
+            $opsview_instance_id,
+        );
+    }
+
+    my $now           = time();
+    my $seconds_taken = $now - $load_start_timev;
+
+    my $last_reload = $reloadtimes_rs->search( { duration => \"IS NOT NULL" }, { order_by => { -desc => "id" } } )->first;
+    my $last_reload_duration;
+    if ($last_reload) {
+        $last_reload_duration = $last_reload->duration;
+    }
+
+    my $reloads = $reloadtimes_rs->search( { end_config => { -between => [ $start_timev, $end_timev ] } } )->count;
+
+    # Mark successful dataload
+    $logger->info("Finished import for hour");
+    $dataload->load_end_timev($now);
+    $dataload->status("success");
+    $dataload->num_hosts( scalar keys %$num_hosts );
+    $dataload->num_services( scalar keys %$num_services );
+    $dataload->num_serviceresults($num_serviceresults);
+    $dataload->num_perfdata($num_perfdata);
+    $dataload->duration($seconds_taken);
+    $dataload->last_reload_duration($last_reload_duration);
+    $dataload->reloads($reloads);
+    $dataload->update;
+
+    if ( $opts->{v} ) {
+        my $time_taken = parseInterval(
+            seconds => $seconds_taken,
+            String  => 1,
+        );
+        print '- took ', $time_taken, $/;
+    }
+
+    $start_dt->add( hours => 1 );
+    $extra_runs++;
+    $first_ever_run = 0;
+
+    $iterations--;
+    last if $iterations == 0;
+
+}    # main loop
+
+# Cleanup only after all successful imports
+# Keep the last 7 days worth, for debugging purposes
+my $cleanup_timev = $start_timev - ( 60 * 60 * 24 * 7 );
+$odwdb->do("DELETE FROM service_saved_state WHERE start_timev <= $cleanup_timev AND opsview_instance_id = $opsview_instance_id");
+
+# Cleanup on error
+END {
+    if ( $? != 0 ) {
+        if ( $dataload && $dataload->status eq "running" ) {
+            print "Cleanup...", $/;
+            $dataload->load_end_timev( time() );
+            $dataload->status("failed");
+            $dataload->update;
+        }
+    }
+}
+
+# Returns the amount of time that should be added for downtime
+# $scid and $hostid are the multi-master nagios_object_ids
+sub calculate_downtime_seconds {
+    my ( $start_point, $end_point, $scid, $hostid ) = @_;
+    my $this_point               = $start_point;
+    my $seconds_not_ok_scheduled = 0;
+    my $end_of_downtime          = $start_point;    # Assume no downtime
+    if ( my $end_downtime_timev = find_highest_downtime_endtimev( $this_point, $scid, $hostid ) ) {
+        if ( $end_point < $end_downtime_timev ) {
+            $seconds_not_ok_scheduled += ( $end_point - $start_point );
+            $this_point      = $end_point;
+            $end_of_downtime = $end_point;
+        }
+        else {
+            $seconds_not_ok_scheduled += ( $end_downtime_timev - $start_point );
+            $this_point      = $end_downtime_timev;
+            $end_of_downtime = $end_downtime_timev;
+        }
+    }
+    while ( $this_point < $end_point ) {
+
+        # Track forwards and see if there were any downtimes from this_point onwards
+        if ( my $temp_start_timev = find_next_start_downtime_timev( $this_point, $end_point, $scid, $hostid ) ) {
+
+            my $temp_end_timev = find_highest_downtime_endtimev( $temp_start_timev, $scid, $hostid );
+
+            # This could be 0 if there is an error in the downtimes where a start time is after an end time
+            # In this case, break out and don't check for any more downtimes in this hour
+            if ( !$temp_end_timev ) {
+
+                # TODO: log
+                $logger->warn("Got a bad downtime range");
+                last;
+            }
+            if ( $end_point < $temp_end_timev ) {
+                $seconds_not_ok_scheduled += ( $end_point - $temp_start_timev );
+                $this_point = $end_point;
+            }
+            else {
+                $seconds_not_ok_scheduled += ( $temp_end_timev - $temp_start_timev );
+                $this_point = $temp_end_timev;
+            }
+        }
+        else {
+            last;
+        }
+    }
+    return ( $seconds_not_ok_scheduled, $end_of_downtime );
+
+    # These helper functions are moved in here to be available within this scope only
+
+    # At this point in time, are we in a downtime? If so, return the highest end downtime
+    # Returns 0 if no downtime found
+    sub find_highest_downtime_endtimev {
+        my ( $timev, $id, $hid ) = @_;
+        my $highest = 0;
+        if ( exists $downtimes->{$id} ) {
+            foreach my $downtime ( @{ $downtimes->{$id} } ) {
+                if ( ( $downtime->{actual_start_timev} <= $timev ) && ( $timev <= $downtime->{actual_end_timev} ) ) {
+                    $highest = my_max( $highest, $downtime->{actual_end_timev} );
+
+                    # Set the time to this new end time to check for overlapping downtimes
+                    $timev = $highest if $highest;
+                }
+            }
+        }
+        if ($hid) {
+            $highest = my_max( $highest, find_highest_downtime_endtimev( $timev, $hid ) );
+        }
+        return $highest;
+    }
+
+    # At this point in time, is there a downtime about to start? If so, return the lowest start downtime
+    # Returns 0 if no downtime in immediate future
+    sub find_next_start_downtime_timev {
+        my ( $timev, $end_timev, $id, $hid ) = @_;
+        my $lowest = 0;
+        if ( exists $downtimes->{$id} ) {
+            foreach my $downtime ( @{ $downtimes->{$id} } ) {
+                if ( ( $timev <= $downtime->{actual_start_timev} ) && ( $downtime->{actual_start_timev} <= $end_timev ) ) {
+                    $lowest = my_min( $lowest, $downtime->{actual_start_timev} );
+                }
+            }
+        }
+        if ($hid) {
+            $lowest = my_min( $lowest, find_next_start_downtime_timev( $timev, $end_timev, $hid ) );
+        }
+        return $lowest;
+    }
+
+}
+
+# Returns amount of time unacknowledged and if an acknowledgement was found
+sub calculate_acknowledged_seconds {
+    my ( $start_point, $end_point, $hard_state, $id, $host_id ) = @_;
+    my $acknowledgement_found = 0;
+    my $earliest              = 0;
+    my $type;
+    if ($host_id) {
+        $type = "service";
+    }
+    else {
+        $type = "host";
+    }
+    if ( exists $acknowledgements->{$type}->{$id} ) {
+        foreach my $ack ( @{ $acknowledgements->{$type}->{$id} } ) {
+            if ( ( $start_point <= $ack->{entry_timev} ) && ( $ack->{entry_timev} <= $end_point ) ) {
+                $earliest = my_min( $earliest, $ack->{entry_timev} );
+                $acknowledgement_found = 1;
+            }
+        }
+    }
+    if ( $type eq "service" ) {
+
+        # Bit of magic recursion here!
+        my ( $diff, $found ) = calculate_acknowledged_seconds( $start_point, $end_point, $hard_state, $host_id );
+        if ($found) {
+            $acknowledgement_found = 1;
+            $earliest = my_min( $earliest, $start_point + $diff );
+        }
+    }
+    if ($acknowledgement_found) {
+        if ( $hard_state eq "OK" ) {
+            return ( 0, 1 );
+        }
+        else {
+            return ( $earliest - $start_point, 1 );
+        }
+    }
+    else {
+        if ( $hard_state eq "OK" ) {
+            return ( 0, 0 );
+        }
+        else {
+            return ( $end_point - $start_point, 0 );
+        }
+    }
+}
+
+sub my_max { $_[0] > $_[1] ? $_[0] : $_[1]; }
+
+sub my_min {
+    return $_[1] if ( $_[0] == 0 );
+    return $_[0] if ( $_[1] == 0 );
+    $_[0] < $_[1] ? $_[0] : $_[1];
+}
+
+sub find_initial_service_state {
+    my ( $nagios_object_id, $start_datetime ) = @_;
+    my ( $initial_status_datetime, $initial_status, $initial_status_type );
+
+    # Due to a bug in Nagios where hard state changes are not being added into db correctly
+    # when the service is down and host goes down at same time, the statehistory table could be incomplete.
+    # This is fixed in Opsview 2.10, but since db is incomplete, use runtime.nagios_servicechecks to
+    # get prior state, then nagios_statehistory (because it could be a service that is run only once a week)
+    # So current order is: nagios_servicechecks, then nagios_statehistory
+    # Future order: nagios_statehistory, then nagios_servicechecks
+    ( $initial_status_datetime, $initial_status, $initial_status_type ) = $runtimedb->selectrow_array(
+        qq{
+		SELECT start_time,state,state_type 
+		FROM nagios_servicechecks
+		WHERE start_time <= '$start_datetime' AND service_object_id=$nagios_object_id
+		ORDER BY start_time DESC LIMIT 1
+	}
+    );
+    unless ( defined $initial_status ) {
+
+        # Another issue: Nagios does not record first ever state (if OK). Fixed in Opsview 2.8.6(ish)
+        ( $initial_status_datetime, $initial_status, $initial_status_type ) = $runtimedb->selectrow_array(
+            qq{
+			SELECT state_time,state,state_type 
+			FROM nagios_statehistory
+			WHERE state_time <= '$start_datetime' AND object_id=$nagios_object_id AND state_change = 1
+			ORDER BY state_time DESC LIMIT 1
+			}
+        );
+    }
+    return ( $initial_status_datetime, $initial_status, $initial_status_type );
+}
+
+# This is different from Nagios::Plugins' max_state - we set UNKNOWN to be a
+# higher failure state than OK
+sub max_state_text {
+    my ( $a, $b ) = @_;
+    return "CRITICAL" if ( $a eq "CRITICAL" || $b eq "CRITICAL" );
+    return "WARNING"  if ( $a eq "WARNING"  || $b eq "WARNING" );
+    return "UNKNOWN"  if ( $a eq "UNKNOWN"  || $b eq "UNKNOWN" );
+    return "OK"       if ( $a eq "OK"       || $b eq "OK" );
+}
+
+sub convert_state_to_text {
+    my $s = shift;
+    if    ( $s == 0 ) { return "OK" }
+    elsif ( $s == 1 ) { return "WARNING" }
+    elsif ( $s == 2 ) { return "CRITICAL" }
+    elsif ( $s == 3 ) { return "UNKNOWN" }
+    elsif ( $s == 4 ) { return "INDETERMINATE" }
+    $logger->logdie("Invalid service state: $s");
+}
+
+sub convert_host_state_to_text {
+    my $s = shift;
+    if    ( $s == 0 ) { return "UP" }
+    elsif ( $s == 1 ) { return "DOWN" }
+    elsif ( $s == 2 ) { return "UNREACHABLE" }
+    $logger->logdie("Invalid host state: $s");
+}
+
+sub convert_notification_reason_to_text {
+    my $s = shift;
+    if    ( $s == 0 )  { return "NORMAL" }
+    elsif ( $s == 1 )  { return "ACKNOWLEDGEMENT" }
+    elsif ( $s == 2 )  { return "FLAPPING STARTED" }
+    elsif ( $s == 3 )  { return "FLAPPING STOPPED" }
+    elsif ( $s == 4 )  { return "FLAPPING DISABLED" }
+    elsif ( $s == 5 )  { return "DOWNTIME STARTED" }
+    elsif ( $s == 6 )  { return "DOWNTIME STOPPED" }
+    elsif ( $s == 7 )  { return "DOWNTIME CANCELLED" }
+    elsif ( $s == 99 ) { return "CUSTOM" }
+    $logger->logdie("Invalid state: $s");
+}
+
+sub convert_check_type_to_text {
+    my $c = shift;
+    return "ACTIVE" if ( $c == 0 );
+    return "PASSIVE";
+}
+
+sub convert_state_type_to_text {
+    my $s = shift;
+    return "SOFT" if ( $s == 0 );
+    return "HARD";
+}
+
+# Uses $start_timev
+sub duration_within_hour {
+    my $t = shift;
+    if ( $t->{start} < $start_timev ) {
+        return ( $t->{end} - $start_timev );
+    }
+    else {
+        return ( $t->{end} - $t->{start} );
+    }
+}
+
+sub get_odw_perf_label {
+    my ( $odw_host_id, $odw_service_id, $name, $units ) = @_;
+    unless ( exists $cache_perflabels->{$odw_service_id}->{$name}->{$units} ) {
+
+        #
+        # Create perf object in ODW
+        #
+        my $perflabel = Odw::Performancelabel->find_or_create(
+            {   host         => $odw_host_id,
+                servicecheck => $odw_service_id,
+                name         => $name,
+                units        => $units,
+            },
+        );
+        $cache_perflabels->{$odw_service_id}->{$name}->{$units} = $perflabel->id;
+    }
+    return $cache_perflabels->{$odw_service_id}->{$name}->{$units};
+}
+
+sub get_odw_objects {
+    my ($sid) = @_;
+    unless ( exists $cache->{$sid} ) {
+
+        #
+        # Create host object in ODW
+        #
+        my ( $host_name, $servicecheck_name ) = $runtimedb->selectrow_array( "SELECT name1, name2 FROM nagios_objects WHERE object_id = ?", {}, $sid );
+
+        # If host_name is blank, get_odw_host_object will return the deletedhost object
+        my $hid = $runtimedb->selectrow_array( "SELECT object_id FROM nagios_objects WHERE objecttype_id = 1 AND name1 = ? AND name2 IS NULL", {}, $host_name );
+        my $odw_host = get_odw_host_object($hid);
+
+        my $opsview_servicecheck;
+        if ($servicecheck_name) {
+            $opsview_servicecheck = Opsview::Servicecheck->find($servicecheck_name);
+        }
+        else {
+            $logger->warn("Missing servicecheck_name for $sid");
+        }
+
+        #
+        # Create servicecheck object in ODW
+        #
+        my $odw_servicecheck;
+        unless ($opsview_servicecheck) {
+            $odw_servicecheck = Odw::Servicecheck->construct( { id => 1 } );
+        }
+        else {
+
+            # Get keywords for this object_id
+            my $keywords = $runtimedb->selectcol_arrayref( $list_keywords_for_sid_sth, {}, $sid ) || [];
+
+            #print "service=".$opsview_servicecheck->name." servicegroup=".$opsview_servicecheck->servicegroup,$/;
+            # Use $servicecheck_name because autogenerated servicechecks do not have an object associated
+            $odw_servicecheck = Odw::Servicecheck->find_or_create_with_crc(
+                { hostname => $odw_host->name, name => $servicecheck_name },
+                {   description      => $opsview_servicecheck->description,
+                    servicegroup     => $opsview_servicecheck->servicegroup->name,
+                    nagios_object_id => ( $sid + $instance_addition ),
+                    host             => $odw_host->id,
+                    keywords         => "," . join( ",", @$keywords ) . ",",
+                },
+            );
+        }
+        $cache->{$sid}->{odw_host_object}    = $odw_host;
+        $cache->{$sid}->{odw_service_object} = $odw_servicecheck;
+    }
+    return $cache->{$sid};
+}
+
+sub get_odw_host_object {
+    my ($hid) = @_;
+    return Odw::Host->construct( { id => 1 } ) unless defined $hid;    # Can be seen that $hid is empty - don't understand how
+    unless ( exists $cache_host->{$hid} ) {
+
+        #
+        # Create host object in ODW
+        #
+        my ($host_name) = $runtimedb->selectrow_array( "SELECT name1 FROM nagios_objects WHERE object_id = ? AND objecttype_id = 1", {}, $hid );
+
+        my $odw_host;
+        my $opsview_host;
+        if ($host_name) {
+            $opsview_host = Opsview::Host->search( { name => $host_name } )->first;
+        }
+        else {
+
+            # Warn, but use deletedhost object
+            $logger->warn("Missing host_name for $hid");
+        }
+
+        unless ($opsview_host) {
+            $odw_host = Odw::Host->construct( { id => 1 } );
+        }
+        else {
+
+            #print "name=".$opsview_host->name," hostgroup=".$opsview_host->hostgroup,$/;
+            $odw_host = Odw::Host->find_or_create_with_crc(
+                { name => $opsview_host->name },
+                {   hostgroup           => $opsview_host->hostgroup->name,
+                    alias               => $opsview_host->alias,
+                    monitored_by        => $opsview_host->monitored_by->name,
+                    hostgroups          => $opsview_host->hostgroup_1_to_9,
+                    nagios_object_id    => ( $hid + $instance_addition ),
+                    opsview_instance_id => $opsview_instance_id,
+                },
+            );
+        }
+        $cache_host->{$hid} = $odw_host;
+    }
+    return $cache_host->{$hid};
+}
+
+sub usage {
+    my $message = shift;
+
+    print $message, $/ if ( defined($message) );
+    print <<"!EOF!";
+Usage: $Script [-h] [-q] [-d "YYYY-MM-DD HH" ]
+Where: 
+	-h                  This help text
+	-q                  Quiet
+	-v                  Show current time when beginning each iteration
+	-i X                Number of iterations to import instead of all available
+	-r "YYYY-MM-DD HH"  Date to restart importing - only use
+	                    if a whole period of data has been lost
+!EOF!
+
+    exit defined($message) ? 1 : 0;
+}
+
+# This is required because sometimes Nagios doesn't send a "downtime end" to runtime db - not sure why
+# This sets actual_end_datetime to scheduled_end_datetime if scheduled_end_datetime has passed the hour period
+# Only does this for the current instance id
+sub fix_nonending_downtimes {
+    my ( $end_datetime, $tablename ) = @_;
+    my $sth;
+    $sth = $odwdb->prepare( "
+SELECT actual_start_datetime, actual_end_datetime, nagios_object_id, nagios_internal_downtime_id, scheduled_end_datetime
+FROM $tablename
+WHERE 
+ scheduled_end_datetime <= ?
+ AND actual_end_datetime = ?
+ AND nagios_object_id BETWEEN ? AND ?
+" );
+    $sth->execute( $end_datetime, $future_datetime, $object_id_range_start, $object_id_range_end );
+    while ( my $row = $sth->fetchrow_hashref ) {
+        $logger->info( "$tablename: Setting actual_end_datetime to " . $row->{scheduled_end_datetime} . " for object_id=" . $row->{nagios_object_id} . " and start time=" . $row->{actual_start_datetime} . ". Was set to " . $row->{actual_end_datetime} );
+        my $rows_changed = $odwdb->do(
+            "UPDATE $tablename
+		SET actual_end_datetime=?
+		WHERE nagios_internal_downtime_id = ?
+		AND actual_start_datetime = ?
+		AND nagios_object_id = ?",
+            {},
+            $row->{scheduled_end_datetime},
+            $row->{nagios_internal_downtime_id},
+            $row->{actual_start_datetime},
+            $row->{nagios_object_id},
+        );
+        if ( $rows_changed != 1 ) {
+            $logger->warn("Rows changed: $rows_changed");
+        }
+    }
+}
+
+sub insert_summarised_perfdata {
+    my ( $start_datetime, $perfdata_list ) = @_;
+    my $sql = qq{INSERT INTO performance_hourly_summary (start_datetime, performance_label, average, max, min, count, stddev, stddevp, first, sum) VALUES ( ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)};
+    my $sth = $odwdb->prepare_cached($sql);
+    foreach my $perflabelid ( keys %$perfdata_list ) {
+        my $vals = $perfdata_list->{$perflabelid};
+        $sth->execute( $start_datetime, $perflabelid, mean(@$vals), max(@$vals), min(@$vals), count(@$vals), stddev(@$vals), stddevp(@$vals), $vals->[0], sum(@$vals), );
+    }
+}
+

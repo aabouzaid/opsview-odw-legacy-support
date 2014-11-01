@@ -1,0 +1,59 @@
+#!/usr/bin/perl
+
+# Copyright (C) 2003-2012 Opsview Limited. All rights reserved
+#
+# This is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+#
+# This software is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with Opsview; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
+
+# Dump parts of mysql required to investigate calculations in ODW
+
+use warnings;
+use strict;
+use lib "/usr/local/nagios/perl/lib";
+use lib "/usr/local/nagios/lib";
+use Odw;
+use Getopt::Std;
+use DateTime::Format::Natural;
+use DateTime::Format::Strptime;
+
+my $opts = {};
+getopts( "h:s:", $opts ) or die "Invalid opts";
+
+my $from_time = join( " ", @ARGV ) || "last week";
+my $dt = DateTime::Format::Natural->new->parse_datetime($from_time);
+$dt->set_formatter( DateTime::Format::Strptime->new( pattern => "%F" ) );
+
+# This is not currently possible using mysqldump
+my $hostname    = $opts->{h} || "";
+my $servicename = $opts->{s} || "";
+
+print STDERR "From date: $dt\n";
+print STDERR "Press Enter to dump to stdout\n";
+$_ = <STDIN>;
+
+my $username = Opsview::Config->odw_dbuser;
+my $password = Opsview::Config->odw_dbpasswd;
+my $dbhost   = Opsview::Config->odw_dbhost;
+my $db       = Opsview::Config->odw_db;
+
+my $where;
+my @mysqldump = ( "mysqldump", "-u", $username, "-p$password", "-h", "$dbhost" );
+system( @mysqldump, "--where", "start_datetime >= '$dt'",             $db, "service_availability_hourly_summary" ) == 0 or die "Error";
+system( @mysqldump, "--where", "start_timev >= '" . $dt->epoch . "'", $db, "service_saved_state" ) == 0                 or die "Error";
+system( @mysqldump, "--where", "datetime >= '$dt'",                   $db, "state_history" ) == 0                       or die "Error";
+system( @mysqldump, "--where", "actual_start_datetime >= '$dt'",      $db, "downtime_host_history" ) == 0               or die "Error";
+system( @mysqldump, "--where", "actual_start_datetime >= '$dt'",      $db, "downtime_service_history" ) == 0            or die "Error";
+system( @mysqldump, "--where", "entry_datetime >= '$dt'",             $db, "acknowledgement_host" ) == 0                or die "Error";
+system( @mysqldump, "--where", "entry_datetime >= '$dt'",             $db, "acknowledgement_service" ) == 0             or die "Error";
+system( @mysqldump, $db, "hosts", "servicechecks" ) == 0 or die "Error";

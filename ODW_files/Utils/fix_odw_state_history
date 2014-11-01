@@ -1,0 +1,73 @@
+#!/usr/bin/perl
+#
+#
+# SYNTAX:
+# 	fix_odw_state_history [-f]
+#
+# DESCRIPTION:
+#	Fixes state_history table in ODW where the prior state is incorrectly calculated
+#	Looks through for all things that have datetime = prior_status_datetime
+#	Then works out if any of these things have prior states that should be used instead
+#	-f to actually do the fix, otherwise just lists the affected services
+#
+# AUTHORS:
+#	Copyright (C) 2003-2012 Opsview Limited. All rights reserved
+#
+#    This file is part of Opsview
+#
+#    Opsview is free software; you can redistribute it and/or modify
+#    it under the terms of the GNU General Public License as published by
+#    the Free Software Foundation; either version 2 of the License, or
+#    (at your option) any later version.
+#
+#    Opsview is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    GNU General Public License for more details.
+#
+#    You should have received a copy of the GNU General Public License
+#    along with Opsview; if not, write to the Free Software
+#    Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
+#
+
+use warnings;
+use strict;
+use lib "/usr/local/nagios/perl/lib";
+use lib "/usr/local/nagios/lib";
+use Odw;
+
+my $odwdb = Odw->db_Main;
+
+my $debug = 1;
+$debug = 0 if ( @ARGV && $ARGV[0] eq "-f" );
+
+# Read in all candidates
+my $sth = $odwdb->prepare( "
+SELECT datetime, servicecheck, status, prior_status_datetime, prior_status
+FROM state_history
+WHERE datetime = prior_status_datetime
+" );
+$sth->execute;
+while ( my ( $datetime, $servicecheckid, $status, $prior_status_datetime, $prior_status ) = $sth->fetchrow_array ) {
+
+    my ( $hostname, $servicename ) = $odwdb->selectrow_array( "SELECT hostname, name FROM servicechecks WHERE id=?", {}, $servicecheckid );
+    my $count = $odwdb->selectrow_array( "SELECT COUNT(*) FROM servicechecks WHERE hostname = ? AND name = ? AND id < ?", {}, $hostname, $servicename, $servicecheckid );
+
+    if ( $count > 0 ) {
+        print "Would fix " if ($debug);
+        print "hostname=$hostname servicename=$servicename\n";
+        if ( !$debug ) {
+            my ( $use_prior_datetime, $use_prior_state ) = $odwdb->selectrow_array( "
+SELECT datetime, status 
+FROM state_history, servicechecks 
+WHERE state_history.servicecheck=servicechecks.id 
+ AND servicechecks.hostname=? 
+ AND servicechecks.name=? 
+ AND state_history.datetime < ? 
+ORDER BY datetime DESC
+LIMIT 1
+", {}, $hostname, $servicename, $datetime );
+            $odwdb->do( "UPDATE state_history SET prior_status=?, prior_status_datetime=? WHERE datetime=? AND servicecheck=?", {}, $use_prior_state, $use_prior_datetime, $datetime, $servicecheckid );
+        }
+    }
+}

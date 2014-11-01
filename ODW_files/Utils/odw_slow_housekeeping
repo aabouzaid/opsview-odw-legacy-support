@@ -1,0 +1,197 @@
+#!/usr/bin/perl
+#
+#
+# SYNTAX:
+#	odw_slow_housekeeping
+#
+# DESCRIPTION:
+#	Run on opsview master
+#	Invoked manually only
+#	Should not cause problems if run too often
+#       Performs slow, low priority, deletes from ODW database for when retention
+#         period is significantly reduced (the nightly job may have impact on
+#         the system when doing the same task)
+#
+# AUTHORS:
+#	Copyright (C) 2003-2012 Opsview Limited. All rights reserved
+#
+#    This file is part of Opsview
+#
+#    Opsview is free software; you can redistribute it and/or modify
+#    it under the terms of the GNU General Public License as published by
+#    the Free Software Foundation; either version 2 of the License, or
+#    (at your option) any later version.
+#
+#    Opsview is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    GNU General Public License for more details.
+#
+#    You should have received a copy of the GNU General Public License
+#    along with Opsview; if not, write to the Free Software
+#    Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
+#
+
+use warnings;
+use strict;
+use FindBin qw($Bin);
+use lib $Bin, "$Bin/../lib", "$Bin/../etc", "$Bin/../perl/lib";
+use Carp;
+use Opsview;
+use Opsview::Systempreference;
+use Odw;
+
+# Number of months to keep specific odw data
+my $odw_large_retention_months = Opsview::Systempreference->odw_large_retention_months;
+my $odw_small_retention_months = Opsview::Systempreference->odw_small_retention_months;
+
+my $odw = Odw->db_Main;
+if ( $odw_large_retention_months && $odw_large_retention_months > 0 ) {
+    my $data_cutoff = $odw->selectrow_array("SELECT (NOW() - INTERVAL $odw_large_retention_months MONTH) FROM DUAL");
+
+    # remove old servicecheck_results data
+    #$odw->do( "DELETE FROM servicecheck_results WHERE start_datetime <= ?", {}, $data_cutoff );
+    low_priority_delete(
+        database => $odw,
+        table    => 'servicecheck_results',
+        column   => 'start_datetime',
+        cut_off  => $data_cutoff,
+    );
+
+    # remove old performance_data data
+    #$odw->do( "DELETE FROM performance_data WHERE datetime <= ?", {}, $data_cutoff );
+    low_priority_delete(
+        database => $odw,
+        table    => 'performance_data',
+        column   => 'datetime',
+        cut_off  => $data_cutoff,
+    );
+}
+
+if ( $odw_small_retention_months && $odw_small_retention_months > 0 ) {
+    my $data_cutoff = $odw->selectrow_array("SELECT (NOW() - INTERVAL $odw_small_retention_months MONTH) FROM DUAL");
+
+    #$odw->do( "DELETE FROM state_history WHERE datetime <= ?",                             {}, $data_cutoff );
+    low_priority_delete(
+        database => $odw,
+        table    => 'state_history',
+        column   => 'datetime',
+        cut_off  => $data_cutoff,
+    );
+
+    #$odw->do( "DELETE FROM notification_host_history WHERE entry_datetime <= ?",           {}, $data_cutoff );
+    low_priority_delete(
+        database => $odw,
+        table    => 'notification_host_history',
+        column   => 'entry_datetime',
+        cut_off  => $data_cutoff,
+    );
+
+    #$odw->do( "DELETE FROM notification_service_history WHERE entry_datetime <= ?",        {}, $data_cutoff );
+    low_priority_delete(
+        database => $odw,
+        table    => 'notification_service_history',
+        column   => 'entry_datetime',
+        cut_off  => $data_cutoff,
+    );
+
+    #$odw->do( "DELETE FROM downtime_host_history WHERE actual_end_datetime <= ?",          {}, $data_cutoff );
+    low_priority_delete(
+        database => $odw,
+        table    => 'downtime_host_history',
+        column   => 'actual_end_datetime',
+        cut_off  => $data_cutoff,
+    );
+
+    #$odw->do( "DELETE FROM downtime_service_history WHERE actual_end_datetime <= ?",       {}, $data_cutoff );
+    low_priority_delete(
+        database => $odw,
+        table    => 'downtime_service_history',
+        column   => 'actual_end_datetime',
+        cut_off  => $data_cutoff,
+    );
+
+    #$odw->do( "DELETE FROM acknowledgement_host WHERE entry_datetime <= ?",                {}, $data_cutoff );
+    low_priority_delete(
+        database => $odw,
+        table    => 'acknowledgement_host',
+        column   => 'entry_datetime',
+        cut_off  => $data_cutoff,
+    );
+
+    #$odw->do( "DELETE FROM acknowledgement_service WHERE entry_datetime <= ?",             {}, $data_cutoff );
+    low_priority_delete(
+        database => $odw,
+        table    => 'acknowledgement_service',
+        column   => 'entry_datetime',
+        cut_off  => $data_cutoff,
+    );
+
+    #$odw->do( "DELETE FROM service_availability_hourly_summary WHERE start_datetime <= ?", {}, $data_cutoff );
+    low_priority_delete(
+        database => $odw,
+        table    => 'service_availability_hourly_summary',
+        column   => 'start_datetime',
+        cut_off  => $data_cutoff,
+    );
+
+    #$odw->do( "DELETE FROM service_outages WHERE end_datetime <= ?", {}, $data_cutoff );
+    low_priority_delete(
+        database => $odw,
+        table    => 'service_outages',
+        column   => 'end_datetime',
+        cut_off  => $data_cutoff,
+    );
+
+}
+
+# Run data removal at a much lower priority than a plain DELETE otherwise
+# some queries can be locked out of a table for far too long, causing
+# other problems.
+# A straight DELETE that takes 60 seconds will take closer to 240 seconds
+# this way, but its much lighter on the system
+sub low_priority_delete {
+    my (%arg_for) = @_;
+
+    $arg_for{limit}      ||= 5000;
+    $arg_for{comparison} ||= '<=';
+
+    for my $required (qw/ database table column cut_off /) {
+        croak "Argument '$required' missing" if ( !$arg_for{$required} );
+    }
+
+    # perform deletes in batches of 1000 to prevent table locking and
+    # preventing queuing up other (more important) queries
+    my $count = 1;
+
+    # if an primary key column has been provided use that instead
+    # as the search can be quicker when using the ID column instead
+    # of the datetime column
+    if ( defined( $arg_for{primary_column} ) ) {
+        my $primary_column_value = $arg_for{database}->selectcol_arrayref( "
+            SELECT MAX( $arg_for{ primary_column } )
+            FROM $arg_for{table}
+            WHERE $arg_for{column} $arg_for{comparison} '$arg_for{cut_off}'
+        " )->[0];
+        if ($primary_column_value) {
+            while ( $count != 0 ) {
+                $count = $arg_for{database}->do( "
+                DELETE LOW_PRIORITY
+                FROM $arg_for{table}
+                WHERE $arg_for{primary_column} $arg_for{comparison} '$primary_column_value'
+                LIMIT $arg_for{limit}
+            " );
+            }
+        }
+    }
+    else {
+        while ( $count != 0 ) {
+            $count = $arg_for{database}->do( "
+            DELETE LOW_PRIORITY
+            FROM $arg_for{table}
+            WHERE $arg_for{column} $arg_for{comparison} '$arg_for{cut_off}'
+            LIMIT $arg_for{limit}
+        " );
+        }
+    }
+}

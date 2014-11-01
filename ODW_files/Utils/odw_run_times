@@ -1,0 +1,45 @@
+#!/usr/bin/perl
+
+# $Id: count_runtime_tables 313 2007-10-23 16:55:06Z duncan $
+#
+# Copyright (C) 2003-2012 Opsview Limited. All rights reserved
+#
+# This is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+#
+# This software is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with Opsview; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
+
+use warnings;
+use strict;
+
+use lib "/usr/local/nagios/perl/lib";
+use lib "/usr/local/nagios/lib";
+use lib "/usr/local/nagios/etc";
+use Odw;
+use Odw::Dataload;
+
+my $dbh = Odw->db_Main;
+
+my $dataloads = Odw::Dataload->retrieve_all;
+
+while ( my $dataload = $dataloads->next ) {
+    print 'Start => ', $dataload->load_start_timev, $/;
+    print 'End => ',   $dataload->load_end_timev,   $/;
+
+    if ( $dataload->load_end_timev && $dataload->load_start_timev ) {
+        my $duration = $dataload->load_end_timev - $dataload->load_start_timev;
+
+        my ( $hours, $minutes, $seconds ) = $duration->in_units( 'hours', 'minutes', 'seconds' );
+
+        print 'Duration => ', "$hours hours, $minutes minutes, $seconds seconds", $/;
+    }
+}
