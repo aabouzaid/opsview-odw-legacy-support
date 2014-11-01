@@ -115,8 +115,8 @@ find ./ODW_files/ -type f | while read odw_file_path; do
   #Copying each ODW files to Nagios/Opsview.
   echo "  - $odw_file_name => $nagios_copy_path/$odw_file_name"
   cp -a $odw_file_path $nagios_copy_path/$odw_file_name &&
-  chown -R nagios:nagios $nagios_copy_path/$odw_file_name &&
-  chmod -R 550 $nagios_copy_path/$odw_file_name
+  chown nagios:nagios $nagios_copy_path/$odw_file_name &&
+  chmod 550 $nagios_copy_path/$odw_file_name
 
   #Check exit status of previous operation.
   check_exit_status
