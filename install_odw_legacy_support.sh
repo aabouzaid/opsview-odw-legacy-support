@@ -80,15 +80,15 @@ find ./ODW_files/ -type f | while read odw_file_path; do
   #Print message when start copying each directory and set its path in nagios.
   case $dirname_of_odw_file in
     "$ODW_FILES_PATH/Bin")
-      [[ $dirname_of_odw_file != $dirname_of_previous_odw_file ]] && echo -e "\nCopying ODW/Bin files ..."
+      dir="Bin"
       nagios_copy_path="/usr/local/nagios/bin"
     ;;
     "$ODW_FILES_PATH/Installer")
-      [[ $dirname_of_odw_file != $dirname_of_previous_odw_file ]] && echo -e "\nCopying ODW/Installer files ..."
+      dir="Installer"
       nagios_copy_path="/usr/local/nagios/installer"
     ;;
     "$ODW_FILES_PATH/Lib")
-      [[ $dirname_of_odw_file != $dirname_of_previous_odw_file ]] && echo -e "\nCopying ODW/Lib files ..."
+      dir="Lib"
       nagios_copy_path="/usr/local/nagios/lib"
     ;;
     "$ODW_FILES_PATH/Lib/Odw")
@@ -96,14 +96,18 @@ find ./ODW_files/ -type f | while read odw_file_path; do
       nagios_copy_path="/usr/local/nagios/lib/Odw"
     ;;
     "$ODW_FILES_PATH/Libexec")
-      [[ $dirname_of_odw_file != $dirname_of_previous_odw_file ]] && echo -e "\nCopying ODW/Libexec files ..."
+      dir="Libexec"
       nagios_copy_path="/usr/local/nagios/libexec"
     ;;
     "$ODW_FILES_PATH/Utils")
-      [[ $dirname_of_odw_file != $dirname_of_previous_odw_file ]] && echo -e "\nCopying ODW/Utils files ..."
+      dir="Utils"
       nagios_copy_path="/usr/local/nagios/utils"
     ;;
   esac
+
+  if [[ $dirname_of_odw_file != $dirname_of_previous_odw_file ]]; then
+    echo -e "\nCopying ODW/$dir files ..."
+  fi
 
   dirname_of_previous_odw_file=$(dirname $odw_file_path)
   odw_file_name=$(basename $odw_file_path)
