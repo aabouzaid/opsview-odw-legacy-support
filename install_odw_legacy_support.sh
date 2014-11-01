@@ -16,8 +16,8 @@
 #       1. All ODW files/scripts are from Opsview Community 20120424 (The last Community Version).
 #       2. This script tested with Opsview Core 3.20131016.0 and RHEL/Cetnos 6.5.
 #       3. Some Opsview scripts have multi fuctions beside ODW functions,
-#          so all files included with odw_legacy_support script get back to ODW only,
-#          and any script has multi functions didn't included. (e.g. utils/rename_host script)"
+#          any script has multi functions didn't included (e.g. utils/rename_host script).
+#          So all files included with odw_legacy_support script get back to ODW only.
 #       4. This script working and tested with option "enable_odw_import" only,
 #          the option "enable_full_odw_import" didn't tested practically yet.
 #
@@ -68,8 +68,8 @@ check_exit_status () {
 ##############################################################
 
 echo "REMEMBER! some Opsview scripts have multi fuctions plus ODW function, \
-so all files included with odw_legacy_support script get back to ODW only, \
-and any script has multi functions didn't included."
+and any script has multi functions didn't included (e.g. utils/rename_host script). \
+So all files included with odw_legacy_support script get back to ODW only."
 
 ODW_FILES_PATH="./ODW_files"
 
