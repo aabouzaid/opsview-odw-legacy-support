@@ -8,7 +8,7 @@ Don't have any, just run it.
 
 #####DESCRIPTION:
 Simple script to install "Opsview Data Warehouse" (ODW) that no longer available with "Opsview Core".<br>
-ODW was a part of "Opsview Community" (has been deprecated for a while now) and this script making ODW working with "Opsview Core".<br>
+ODW was a part of "Opsview Community" (had been deprecated for a while now) and this script making ODW working with "Opsview Core".<br>
 For more information please check:<br>
 - http://docs.opsview.com/doku.php?id=opsview-core:upgrading:upgradetocore<br>
 - http://docs.opsview.com/doku.php?id=opsview4.4:odw<br>
