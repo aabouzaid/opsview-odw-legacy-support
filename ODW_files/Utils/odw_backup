@@ -1,0 +1,30 @@
+#!/bin/bash
+
+# Copyright (C) 2003-2012 Opsview Limited. All rights reserved
+#
+# This is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+#
+# This software is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with Opsview; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
+
+# perform backup then delete older backup files
+
+eval `/usr/local/nagios/bin/opsview.sh`
+
+date=$(date +\%Y-\%m-\%d-\%H\%M)
+prefix=odw-db
+postfix=sql.gz
+
+/usr/local/nagios/bin/db_odw db_backup | gzip -9 -c > $BACKUP_DIR/$prefix-$date.$postfix
+
+find $BACKUP_DIR -name "$prefix-*.$postfix" -mtime +$BACKUP_RETENTION_DAYS -exec rm {} \;
+

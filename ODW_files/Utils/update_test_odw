@@ -1,0 +1,13 @@
+#!/bin/bash
+cd /usr/local/nagios
+
+echo "Upgrading ODW (myisam)"
+bin/db_odw -t db_restore < t/var/odw.db
+installer/upgradedb_odw.pl
+
+echo "Upgrading ODW (innodb)"
+bin/db_odw -t db_restore < t/var/odw.db
+installer/upgradedb_odw.pl
+bin/db_odw -t db_backup > t/var/odw.db
+
+echo "All happy"

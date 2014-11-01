@@ -1,0 +1,573 @@
+#!/bin/bash
+# 
+#
+# SYNTAX:
+#	db_odw {db_install}
+#
+# DESCRIPTION:
+# 	This is the script to create the odw database
+#	$1 is the action to take
+#
+# AUTHORS:
+#	Copyright (C) 2003-2012 Opsview Limited. All rights reserved
+#
+#    This file is part of Opsview
+#
+#    Opsview is free software; you can redistribute it and/or modify
+#    it under the terms of the GNU General Public License as published by
+#    the Free Software Foundation; either version 2 of the License, or
+#    (at your option) any later version.
+#
+#    Opsview is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    GNU General Public License for more details.
+#
+#    You should have received a copy of the GNU General Public License
+#    along with Opsview; if not, write to the Free Software
+#    Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
+#
+
+# Unsupported at the moment
+function db_export {
+	echo "SET FOREIGN_KEY_CHECKS=0;"
+	eval mysqldump --no-create-info --extended-insert=false --complete-insert $user_parms $db
+	echo "SET FOREIGN_KEY_CHECKS=1;"
+}
+
+# Dumps a subset of the database. All the dimension tables + 2 months of the big tables
+function db_backup_test {
+    main_tables="dataloads schema_version database_version locks service_saved_state metadata"
+    dimension_tables="hosts servicechecks performance_labels"
+    fact_small_tables="acknowledgement_host acknowledgement_service notification_host_history notification_service_history downtime_host_history downtime_service_history state_history service_availability_hourly_summary"
+    fact_big_tables="servicecheck_results performance_data"
+
+    # Dump table structures
+    eval mysqldump $user_parms -d $db
+
+    eval mysqldump $user_parms -l $db $main_tables
+    eval mysqldump $user_parms -l $db $dimension_tables
+    eval mysqldump $user_parms -l $db $fact_small_tables
+
+    # Need to double quote the where command because eval will remove and then execute with it
+    # Also need to have different queries as the datetime column is named differently 
+    eval mysqldump $user_parms -l "--where='start_datetime > NOW() - INTERVAL 2 MONTH'" $db servicecheck_results
+    eval mysqldump $user_parms -l "--where='datetime > NOW() - INTERVAL 2 MONTH'" $db performance_data
+}
+
+# Unsupported at the moment
+function db_import {
+	egrep -v '^INSERT INTO `metadata`' | eval mysql $user_parms $db || die "Cannot import"
+	eval check_constraints.sh $user_parms $db | grep "|" > /dev/null
+	if [ $? -eq 0 ] ; then
+		echo "Error with constraints - use check_constraints.sh to see where problems and check import file"
+		exit 1
+	fi
+}
+
+function db_install {
+
+	eval mysql $user_parms <<-EOF || die "Cannot install db"
+	# Create db
+	DROP DATABASE IF EXISTS $db;
+	CREATE DATABASE $db;
+	USE $db;
+
+	# --------------------------------------------------------
+	#
+	# Table structures
+	#
+
+	CREATE TABLE availability (
+		date DATE NOT NULL,
+		hostname varchar(128) NOT NULL,
+		servicename varchar(128) NOT NULL,
+		percent_total_time_okay double NOT NULL,
+		percent_total_scheduled_downtime double NOT NULL,
+		percent_total_unscheduled_downtime double NOT NULL,
+		INDEX (date),
+		INDEX (hostname),
+		INDEX (servicename),
+		UNIQUE (date, hostname, servicename)
+	) ENGINE=InnoDB;
+
+	CREATE TABLE availability_host_summary (
+		date DATE NOT NULL,
+		hostname varchar(128) NOT NULL,
+		percent_total_time_okay double NOT NULL,
+		percent_total_scheduled_downtime double NOT NULL,
+		percent_total_unscheduled_downtime double NOT NULL,
+		INDEX (date),
+		INDEX (hostname),
+		UNIQUE (date, hostname)
+	) ENGINE=InnoDB;
+
+	CREATE TABLE availability_hostgroup_summary (
+		date DATE NOT NULL,
+		hostgroup varchar(128) NOT NULL,
+		percent_total_time_okay double NOT NULL,
+		percent_total_scheduled_downtime double NOT NULL,
+		percent_total_unscheduled_downtime double NOT NULL,
+		INDEX (date),
+		INDEX (hostgroup),
+		UNIQUE (date, hostgroup)
+	) ENGINE=InnoDB;
+
+	CREATE TABLE availability_summary (
+		date DATE NOT NULL,
+		percent_total_time_okay double NOT NULL,
+		percent_total_scheduled_downtime double NOT NULL,
+		percent_total_unscheduled_downtime double NOT NULL,
+		INDEX (date),
+		UNIQUE (date)
+	) ENGINE=InnoDB;
+
+	CREATE TABLE events (
+		datetime DATETIME NOT NULL,
+		type ENUM ("host", "service") NOT NULL,
+		hostname varchar(128) NOT NULL,
+		servicename varchar(128),	# Will be NULL if type=host
+		state varchar(16) NOT NULL,
+		statetype varchar(5) NOT NULL,
+		attempt int NOT NULL,
+		laststatechange DATETIME NOT NULL,
+		executiontimetaken float NOT NULL,
+		latency float NOT NULL,
+		output longtext,
+		INDEX (datetime),
+		INDEX (type)
+	) ENGINE=InnoDB;
+
+	CREATE TABLE reports (
+		id int AUTO_INCREMENT,
+		filename varchar(128) NOT NULL,
+		report_date int,
+		created_on int,
+		created_by varchar(128) NOT NULL,
+		PRIMARY KEY (id),
+		INDEX (filename),
+		UNIQUE (filename)
+	) ENGINE=InnoDB;
+
+	CREATE TABLE report_comments (
+		name varchar(128) NOT NULL,
+		text longtext,
+		PRIMARY KEY (name)
+	) ENGINE=InnoDB;
+
+	#
+	# Data for de-normalised datawarehouse
+	#
+
+	# The nagios_object_id is required for downtime calculations
+	# This value is also incremented based on the opsview instance id
+	CREATE TABLE hosts (
+		id int AUTO_INCREMENT,
+		name varchar(255) NOT NULL,
+		alias varchar(255),
+		hostgroup1 varchar(128),
+		hostgroup2 varchar(128),
+		hostgroup3 varchar(128),
+		hostgroup4 varchar(128),
+		hostgroup5 varchar(128),
+		hostgroup6 varchar(128),
+		hostgroup7 varchar(128),
+		hostgroup8 varchar(128),
+		hostgroup9 varchar(128),
+		hostgroup varchar(128),
+		nagios_object_id int NOT NULL,
+		monitored_by varchar(128),
+		active_date int NOT NULL,
+		crc int,
+		most_recent bool,
+		opsview_instance_id SMALLINT DEFAULT 1,
+		PRIMARY KEY (id),
+		INDEX (name),
+		INDEX (nagios_object_id),
+		UNIQUE (active_date, name)
+	) ENGINE=InnoDB;
+	INSERT INTO hosts (id, name, alias, active_date, most_recent) VALUES (1, "deletedhost", "Host that has been deleted before storing into datawarehouse", UNIX_TIMESTAMP(NOW()), 1);
+
+	# The nagios_object_id is required for downtime calculations
+	# This value is also incremented based on the opsview instance id
+	CREATE TABLE servicechecks (
+		id int AUTO_INCREMENT,
+		hostname varchar(128) NOT NULL,
+		name varchar(128) NOT NULL,
+		host int NOT NULL,
+		nagios_object_id int NOT NULL,	# This field is vital for downtimes to distinguish the same Nagios service over time
+		description varchar(255),
+		servicegroup varchar(128),
+		keywords TEXT,
+		active_date int NOT NULL,
+		crc int,
+		most_recent bool,
+		PRIMARY KEY (id),
+		INDEX (name),
+		INDEX (host),
+		INDEX (nagios_object_id),
+		#UNIQUE (active_date, host, name),		# Not necessarily true if host=1
+		CONSTRAINT servicecheck_host_fk FOREIGN KEY (host) REFERENCES hosts(id)
+	) ENGINE=InnoDB;
+	INSERT INTO servicechecks (id, host, name, description, active_date, most_recent) VALUES (1, 1, "deletedservicecheck", "Servicecheck that has been deleted before storing into datawarehouse", UNIX_TIMESTAMP(NOW()), 1);
+
+	CREATE TABLE servicecheck_results (
+		start_datetime datetime NOT NULL,
+		start_datetime_usec int NOT NULL,
+		servicecheck int NOT NULL,
+		check_type ENUM("ACTIVE","PASSIVE"),
+		status ENUM("OK", "WARNING", "CRITICAL", "UNKNOWN") NOT NULL,
+		status_type ENUM("SOFT","HARD") NOT NULL,
+		duration float NOT NULL,
+		output TEXT NOT NULL,
+		#UNIQUE (start_datetime,start_datetime_usec,servicecheck),	# Not necessarily true where servicecheck = 1
+		INDEX (start_datetime),
+		INDEX (servicecheck),
+		CONSTRAINT servicecheck_results_servicecheck_fk FOREIGN KEY (servicecheck) REFERENCES servicechecks(id)
+	) ENGINE=InnoDB MAX_ROWS=1000000000;
+
+	CREATE TABLE performance_labels (
+		id int AUTO_INCREMENT,
+		host int NOT NULL,
+		servicecheck int NOT NULL,
+		name varchar(64),
+		units varchar(16),
+		PRIMARY KEY (id),
+		#UNIQUE (host, servicecheck, name, units),			# Not necessarily true where host/servicecheck=1
+		INDEX (host),
+		CONSTRAINT performance_labels_host_fk FOREIGN KEY (host) REFERENCES hosts(id),
+		INDEX (servicecheck),
+		CONSTRAINT performance_labels_servicecheck_fk FOREIGN KEY (servicecheck) REFERENCES servicechecks(id)
+	) ENGINE=InnoDB;
+	INSERT INTO performance_labels (id, host, servicecheck, name) VALUES (1, 1, 1, "deletedhostservice");
+
+	CREATE TABLE performance_data (
+		datetime DATETIME NOT NULL,
+		performance_label int NOT NULL,
+		value double NOT NULL,
+		#UNIQUE (datetime,performance_label),				# Not necessarily true where performance_label=1
+		INDEX (datetime),
+		INDEX (performance_label),
+		CONSTRAINT performance_data_performance_labels_fk FOREIGN KEY (performance_label) REFERENCES performance_labels(id)
+	) ENGINE=InnoDB MAX_ROWS=1000000000;
+
+	CREATE TABLE state_history (
+		datetime DATETIME NOT NULL,
+		datetime_usec int NOT NULL,
+		servicecheck int NOT NULL,
+		status ENUM("OK", "WARNING", "CRITICAL", "UNKNOWN") NOT NULL,
+		status_type ENUM("SOFT","HARD") NOT NULL,
+		prior_status_datetime DATETIME NOT NULL,		# This column is redundant - remove in future
+		prior_status ENUM("OK", "WARNING", "CRITICAL", "UNKNOWN", "INDETERMINATE") NOT NULL,
+		output TEXT NOT NULL,
+		INDEX (datetime, servicecheck),
+		CONSTRAINT state_history_servicecheck_fk FOREIGN KEY (servicecheck) REFERENCES servicechecks(id)
+	) ENGINE=InnoDB;
+
+	# There are two passes required to completely fill this table in
+	# Only save started downtimes
+	# Then update when actual_end is known
+	# We don't use host/service ids because they could potentially change
+	# So use nagios_object_id as the key - this will be increased based on the opsview instance id
+	CREATE TABLE downtime_host_history (
+		actual_start_datetime DATETIME NOT NULL,
+		actual_end_datetime DATETIME NOT NULL,	# Will be '2037-01-01 00:00:00' if not ended yet
+		nagios_object_id INT NOT NULL,		# Includes opsview_instance_id addition
+		author_name varchar(128) NOT NULL,	# Hmmm, nagios' author_name is 64 chars
+		comment_data TEXT NOT NULL,
+		entry_datetime DATETIME NOT NULL,
+		scheduled_start_datetime DATETIME NOT NULL,
+		scheduled_end_datetime DATETIME NOT NULL,
+		is_fixed SMALLINT NOT NULL,
+		duration SMALLINT NOT NULL,
+		was_cancelled SMALLINT NOT NULL,
+		nagios_internal_downtime_id INT NOT NULL,
+		INDEX(actual_start_datetime,actual_end_datetime,nagios_object_id),
+		INDEX(nagios_object_id),
+		INDEX(nagios_internal_downtime_id),
+		CONSTRAINT downtime_host_history_nagios_object_id_fk FOREIGN KEY (nagios_object_id) REFERENCES hosts(nagios_object_id)
+	) ENGINE=InnoDB;	
+
+	CREATE TABLE downtime_service_history (
+		actual_start_datetime DATETIME NOT NULL,
+		actual_end_datetime DATETIME NOT NULL,	# Will be '2037-01-01 00:00:00' if not ended yet
+		nagios_object_id INT NOT NULL,		# Includes opsview_instance_id addition
+		author_name varchar(128) NOT NULL,	# Hmmm, nagios' author_name is 64 chars
+		comment_data TEXT NOT NULL,
+		entry_datetime DATETIME NOT NULL,
+		scheduled_start_datetime DATETIME NOT NULL,
+		scheduled_end_datetime DATETIME NOT NULL,
+		is_fixed SMALLINT NOT NULL,
+		duration SMALLINT NOT NULL,
+		was_cancelled SMALLINT NOT NULL,
+		nagios_internal_downtime_id INT NOT NULL,
+		INDEX(actual_start_datetime,actual_end_datetime,nagios_object_id),
+		INDEX(nagios_object_id),
+		INDEX(nagios_internal_downtime_id),
+		CONSTRAINT downtime_service_history_nagios_object_id_fk FOREIGN KEY (nagios_object_id) REFERENCES servicechecks(nagios_object_id)
+	) ENGINE=InnoDB;
+
+	CREATE TABLE acknowledgement_host (
+		entry_datetime DATETIME NOT NULL,
+		host int NOT NULL,
+		author_name varchar(128) NOT NULL,	# Hmmm, nagios' author_name is 64 chars
+		comment_data TEXT NOT NULL,
+		is_sticky SMALLINT NOT NULL,
+		persistent_comment SMALLINT NOT NULL,
+		notify_contacts SMALLINT NOT NULL,
+		INDEX(entry_datetime,host),
+		CONSTRAINT acknowledgement_host_host_fk FOREIGN KEY (host) REFERENCES hosts(id)
+	) ENGINE=InnoDB;	
+
+	CREATE TABLE acknowledgement_service (
+		entry_datetime DATETIME NOT NULL,
+		service int NOT NULL,
+		author_name varchar(128) NOT NULL,	# Hmmm, nagios' author_name is 64 chars
+		comment_data TEXT NOT NULL,
+		is_sticky SMALLINT NOT NULL,
+		persistent_comment SMALLINT NOT NULL,
+		notify_contacts SMALLINT NOT NULL,
+		INDEX(entry_datetime,service),
+		CONSTRAINT acknowledgement_service_service_fk FOREIGN KEY (service) REFERENCES servicechecks(id)
+	) ENGINE=InnoDB;	
+
+	CREATE TABLE notification_host_history (
+		entry_datetime DATETIME NOT NULL,
+		host int NOT NULL,
+		status ENUM("UP", "DOWN", "UNREACHABLE"),
+		output TEXT,
+		notification_reason ENUM("NORMAL","ACKNOWLEDGEMENT","FLAPPING STARTED","FLAPPING STOPPED","FLAPPING DISABLED","DOWNTIME STARTED","DOWNTIME STOPPED","DOWNTIME CANCELLED","CUSTOM") NOT NULL,
+		notification_number SMALLINT NOT NULL,
+		contactname varchar(128) NOT NULL,
+		methodname varchar(128) NOT NULL,
+		INDEX(entry_datetime,host),
+		CONSTRAINT notification_host_host_fk FOREIGN KEY (host) REFERENCES hosts(id)
+	) ENGINE=InnoDB;
+
+	CREATE TABLE notification_service_history (
+		entry_datetime DATETIME NOT NULL,
+		service int NOT NULL,
+		status ENUM("OK", "WARNING", "CRITICAL", "UNKNOWN"),
+		output TEXT,
+		notification_reason ENUM("NORMAL","ACKNOWLEDGEMENT","FLAPPING STARTED","FLAPPING STOPPED","FLAPPING DISABLED","DOWNTIME STARTED","DOWNTIME STOPPED","DOWNTIME CANCELLED","CUSTOM") NOT NULL,
+		notification_number SMALLINT NOT NULL,
+		contactname varchar(128) NOT NULL,
+		methodname varchar(128) NOT NULL,
+		INDEX(entry_datetime,service),
+		CONSTRAINT notification_service_service_fk FOREIGN KEY (service) REFERENCES servicechecks(id)
+	) ENGINE=InnoDB;
+
+	CREATE TABLE service_outages (
+		id int AUTO_INCREMENT,
+		start_datetime DATETIME NOT NULL,
+		servicecheck int NOT NULL,
+		initial_failure_status ENUM("OK", "WARNING", "CRITICAL", "UNKNOWN") NOT NULL,
+		highest_failure_status ENUM("OK", "WARNING", "CRITICAL", "UNKNOWN") NOT NULL,
+		started_in_scheduled_downtime bool DEFAULT 0,
+		hard_state_datetime DATETIME DEFAULT NULL,
+		acknowledged_datetime DATETIME DEFAULT NULL,
+		acknowledged_by varchar(64) DEFAULT NULL,
+		acknowledged_comment varchar(255) DEFAULT NULL,
+		scheduled_downtime_end_datetime DATETIME DEFAULT NULL,
+		downtime_duration int DEFAULT NULL,
+		end_datetime DATETIME DEFAULT NULL,
+		PRIMARY KEY (id),
+		#UNIQUE (start_datetime, servicecheck),		# Not true - if servicecheck=1, could be duplicated
+		INDEX (start_datetime),
+		INDEX (end_datetime),
+		INDEX (servicecheck),
+		CONSTRAINT service_outages_servicecheck_fk FOREIGN KEY (servicecheck) REFERENCES servicechecks(id)
+	) ENGINE=InnoDB;
+
+	# This table is a helper table to allow quick retrieval of the state of all services since the last import
+	# Will be housekept by import_runtime
+	CREATE TABLE service_saved_state (
+		start_timev int NOT NULL,	# Use timev because of timezone issues. TODO: ODW and runtime should all be in UTC
+		hostname varchar(128) NOT NULL, # Don't use servicecheck id because this may change if details change
+		servicename varchar(128) NOT NULL,
+		last_state ENUM("OK", "WARNING", "CRITICAL", "UNKNOWN") NOT NULL,
+		last_hard_state ENUM("OK", "WARNING", "CRITICAL", "UNKNOWN") NOT NULL,
+		acknowledged SMALLINT NOT NULL,
+		opsview_instance_id SMALLINT DEFAULT 1,
+		INDEX (hostname,servicename,start_timev),
+        INDEX (start_timev,opsview_instance_id)
+	) ENGINE=InnoDB;
+
+	CREATE TABLE service_availability_hourly_summary (
+		start_datetime DATETIME NOT NULL,
+		servicecheck INT NOT NULL,
+		seconds_ok SMALLINT NOT NULL,
+		seconds_not_ok SMALLINT NOT NULL,			# ok + not ok = 3600 (except when a service has just been created)
+		seconds_warning SMALLINT NOT NULL,
+		seconds_critical SMALLINT NOT NULL,
+		seconds_unknown SMALLINT NOT NULL,
+		seconds_not_ok_hard SMALLINT NOT NULL,
+		seconds_warning_hard SMALLINT NOT NULL,
+		seconds_critical_hard SMALLINT NOT NULL,
+		seconds_unknown_hard SMALLINT NOT NULL,
+		seconds_not_ok_scheduled SMALLINT NOT NULL,
+		seconds_warning_scheduled SMALLINT NOT NULL,
+		seconds_critical_scheduled SMALLINT NOT NULL,
+		seconds_unknown_scheduled SMALLINT NOT NULL,
+		seconds_unacknowledged SMALLINT NOT NULL,
+		#UNIQUE (start_datetime, servicecheck),		# Not true - if servicecheck=1, could be duplicated
+		INDEX (start_datetime),
+		INDEX (servicecheck),
+		CONSTRAINT service_availability_hourly_summary_servicecheck_fk FOREIGN KEY (servicecheck) REFERENCES servicechecks(id)
+	) ENGINE=InnoDB;
+
+	CREATE TABLE performance_hourly_summary (
+		start_datetime DATETIME NOT NULL,
+		performance_label INT NOT NULL,
+        average DOUBLE NOT NULL,
+        max DOUBLE NOT NULL,
+        min DOUBLE NOT NULL,
+        count SMALLINT NOT NULL,
+        stddev DOUBLE NOT NULL,
+        stddevp DOUBLE NOT NULL,
+        first DOUBLE NOT NULL,
+        sum DOUBLE NOT NULL,
+		INDEX (start_datetime),
+		INDEX (performance_label)
+	) ENGINE=InnoDB;
+
+	CREATE TABLE dataloads (
+		id int AUTO_INCREMENT,
+		opsview_instance_id SMALLINT DEFAULT 1,
+		period_start_timev int NOT NULL,
+		period_end_timev int NOT NULL,
+		load_start_timev int NOT NULL,
+		load_end_timev int,
+		status ENUM ("running", "failed", "success"),
+        num_hosts INT DEFAULT NULL, 
+        num_services INT DEFAULT NULL, 
+        num_serviceresults INT DEFAULT NULL, 
+        num_perfdata INT DEFAULT NULL, 
+        duration INT DEFAULT NULL,
+        last_reload_duration SMALLINT DEFAULT NULL,
+        reloads SMALLINT DEFAULT NULL,
+		PRIMARY KEY (id),
+		UNIQUE (period_start_timev, opsview_instance_id),
+		INDEX (period_end_timev),
+		INDEX (status)
+	) ENGINE=InnoDB;
+
+	CREATE TABLE locks (
+		name varchar(32),
+		value INT,
+		PRIMARY KEY (name)
+	) ENGINE=InnoDB;
+	INSERT INTO locks (name, value) VALUES ("import_disabled", 0);
+
+	CREATE TABLE metadata (
+		name varchar(32),
+		value varchar(32),
+		PRIMARY KEY (name)
+	) ENGINE=InnoDB;
+	INSERT INTO metadata (name, value) VALUES ("last_successful_servicecheck_id", 0);
+
+	CREATE TABLE database_version (version varchar(10)) ENGINE=InnoDB;
+	INSERT database_version VALUES ('2.7.8');
+
+	CREATE TABLE schema_version (major_release varchar(16), version varchar(16) ) ENGINE=InnoDB;
+	INSERT INTO schema_version (major_release, version) VALUES ('2.9', '5');
+	INSERT INTO schema_version (major_release, version) VALUES ('2.10', '3');
+	INSERT INTO schema_version (major_release, version) VALUES ('2.12', '4');
+	INSERT INTO schema_version (major_release, version) VALUES ('3.0', '4');
+	INSERT INTO schema_version (major_release, version) VALUES ('3.3', '1');
+	INSERT INTO schema_version (major_release, version) VALUES ('3.7', '1');
+	INSERT INTO schema_version (major_release, version) VALUES ('3.9', '3');
+	INSERT INTO schema_version (major_release, version) VALUES ('3.11', '1');
+EOF
+}
+
+
+function db_backup {
+	if [ $TEST -eq 0 ] ; then
+		eval mysqldump $user_parms --databases $db 
+	else
+		eval mysqldump $user_parms --skip-extended-insert -l --databases $db | egrep -v ^--
+	fi
+}
+
+function db_restore {
+	echo "Restoring database $db"
+
+	echo "DROP DATABASE IF EXISTS $db" | eval mysql $user_parms || die "Cannot drop db"
+
+	eval mysql $user_parms || die "Cannot import"
+
+	if [ $TEST -eq 0 ] ; then
+		# Check constraints is removed for tests because it takes too long to query
+		eval check_constraints.sh $user_parms $db | grep "|" > /dev/null
+		if [ $? -eq 0 ] ; then
+			echo "Error with constraints - use check_constraints.sh to see where problems and check restore file"
+			exit 1
+		fi
+	fi
+}
+
+# Returns 0 if database exists, otherwise 1
+function db_exists {
+        echo "exit" | eval mysql $user_parms $db
+}
+
+die() { echo "$*" >&2; exit 1; }
+
+topdir=${0%/db_odw}
+eval `$topdir/../bin/opsview.sh`
+user=$ODW_DBUSER
+if [ "x$user" = "x" ] ; then
+	die "Opsview variables not set"
+fi
+password="$ODW_DBPASSWD"
+host=$ODW_DBHOST
+db=$ODW_DB
+
+TEST=0
+PATH=$PATH:$topdir:.
+while getopts ":th:" c ; do
+	case $c in
+		t) TEST=1;;
+        h) host=$OPTARG;;
+		*) die "Error: unexpected option $c";;
+	esac
+done
+shift $((OPTIND - 1))
+
+user_parms="-u$user -p'$password' -h$host"
+
+[[ -z $1 ]] && die "Must specify a command"
+
+while [[ -n $1 ]] ; do
+	case "$1" in
+		db_export)
+			db_export
+			;;
+		db_backup_test) 
+			db_backup_test 
+			;;
+		db_import)
+			db_import
+			;;
+		db_install)
+			db_install
+			;;
+		db_backup)
+			db_backup
+			;;
+		db_restore)
+			db_restore
+			;;
+		db_exists)
+			db_exists
+			exit $?
+			;;
+		*)
+			die "Usage: $0 [-h <host>] {db_export|db_import|db_install}"
+			;;
+	esac
+	shift
+done
+  
+# End of this script

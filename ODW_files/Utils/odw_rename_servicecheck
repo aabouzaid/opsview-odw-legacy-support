@@ -1,0 +1,292 @@
+#!/usr/bin/perl
+#
+# $Id$
+#
+
+# NOTES:
+#
+# "perldoc perlpod" for more info on using POD
+# "perldoc Getopt::Long" for more info on using command line options
+#   and imposing limits on what can be used with which switches
+# Any $<text>$ is a CVS/SVN keyword - do not alter!
+# When script is complete, use "perltidy -b -i=2 <script>" to format correctly
+
+# all "use" statements
+use strict;      # ALWAYS USE! Helps to catch bugs and problems much faster
+use warnings;    # ALWAYS USE! Helps to catch bugs and problems much faster
+
+# extra required library search paths
+use lib '/usr/local/nagios/perl/lib';
+use lib '/usr/local/nagios/lib';
+
+# find the path to the script directory and the script name
+use Cwd;
+my ( $script, $scriptname, $scriptdir );
+( $scriptname = $0 ) =~ s!^.*/!!;
+( $scriptdir = Cwd::abs_path($0) ) =~ s!/[^/]+$!!;
+$script = "$scriptdir/$scriptname";
+
+# Pull in functions to use inline POD as output for help options
+use Pod::Usage;
+
+# Pull in functions to parse the command line options
+# Configure command line options to be case sensitive, and allow
+# -v -a -x as -vax (different to --vax).  Long options must also use --'s
+# Also stop long options being abreviated to uniqueness
+use Getopt::Long qw(:config no_ignore_case bundling no_auto_abbrev);
+
+# Suplimentary modules required when customising this script
+# use File::Find;
+# use Some::Other::Module;
+use Odw;
+use Odw::Servicecheck;
+use Readonly;
+use Log::Log4perl;
+use FindBin qw($Bin);
+
+# Version information, as from CVS
+my $_VERS = sprintf( "%d", q$Revision: 1 $ =~ m!(\d+)! );
+my $_DATE = sprintf( "%s %s", q$Date: 2000-01-01 00:00:00 $ =~ m!(\d...-\d.-\d.) (\d.:\d.:\d.)! );
+
+my $VERSION = "$_VERS $_DATE";    # Combined for script version (-V output)
+
+# Start of POD (Perl Online Documentation)
+#   Use "perldoc <script>" or "<script> --help" to read POD
+
+=head1 NAME
+
+odw_rename_servicecheck
+
+=head1 SYNOPSIS
+
+S<< odw_rename_servicecheck [-?hV] <hostname> <old sc id> <new sc id> >>
+
+=head1 DESCRIPTION
+
+Search ODW database for service check <sc old id> on <hostname> and rename
+to <new sc id> for correcting reports
+
+=head1 OPTIONS
+
+=over
+
+=cut
+
+#### Set up default options available for all scripts,
+# i.e. "<script> --version" or "<script> --help"
+# All command line options are stored within a hash for easy access
+# This initialises hash and defines some entries in one go
+# See "perldoc perldata" for more info
+my %options = (
+    'help|h|?'  => 0,
+    'man'       => 0,
+    'version|V' => 0,
+    'debug:+'   => 0,
+);
+
+#### Document default options
+
+=item --help, -?, -h
+
+Display basic help 
+
+=item --man
+
+Display man page
+
+=item --debug [0-9], --debug [--debug [...]]
+
+Enable debugging mode (using more than once increases verbosity, or specify
+a level explicitly to a maximum of level 8) 
+
+=item --version, -V
+
+Show version information
+
+=cut
+
+#### End of options
+
+=back
+
+=head1 ARGUMENTS
+
+=over
+
+=item <hostname>
+
+Hostname to search for within ODW database.  If none given will output all
+available choices.
+
+=item <old sc id>
+
+Service check ID to search for within ODW database.  If none given will 
+output all available choices.
+
+=item <new sc id>
+
+Service check ID to use for the replacemente.  If none given will 
+output all available choices.
+
+=back
+
+=cut
+
+#### start of perl code ####
+
+# Getopt::Long can limit/expand on how switches are used.  This step
+# normalises the options hash to remove optional specifiers used by
+# Getopts::Long.  Show usage (from the inline POD) if any options unrecognised
+GetOptions( \%options, keys(%options) ) || pod2usage( -verbose => 1 );
+
+# output version and exit
+# i.e. "<script> --version" or "<script> -v"
+die("Version: $VERSION\n") if ( $options{version} );
+
+# output basic help text when -?, --help or -h used
+pod2usage( -verbose => 1 ) if ( $options{'?'} || $options{help} );
+
+#output complete help text when -m|--man|-H|--HELP used
+pod2usage( -verbose => 2 ) if ( $options{HELP} || $options{man} );
+
+#### global variables ####
+# Initialise debug variable correctly if not already set by --debug
+$options{debug} ||= 0;
+
+# Set an arbitrary max level of 8 for debug
+$options{debug} = 8 if ( $options{debug} > 8 );
+
+Log::Log4perl::init("$Bin/../etc/Log4perl.conf");
+my $logger = Log::Log4perl->get_logger($scriptname);
+
+#### all sub-routines ####
+
+# description:
+#   given a level and a message, if level <= debug level, output message
+#   Allows for progressivly more output the higher the debug level, as
+#   given by the use of --debug. Saves on "expensive" 3rd party module
+# parameters:
+#   $1 = level --> level (to match debug level)
+#   $2 .. $n   --> list to pass to print
+# returns:
+#   nothing
+sub logmsg($@) {
+    print @_, $/ if ( shift() <= $options{debug} );
+}
+
+# Constant definitions
+Readonly my $TAB => "\t";
+
+#### main ####
+my ( $hostname, $old_sc_id, $new_sc_id ) = @ARGV;
+
+# example command line check for validity of arguments
+if ( !$hostname ) {
+    print 'No hostname given.  Available choices are: ', $/;
+
+    my $odw_hosts = Odw::Host->retrieve_all();
+
+    while ( my $host_object = $odw_hosts->next ) {
+        print $TAB, $host_object->name, $/;
+    }
+    exit 1;
+}
+
+if ( !$old_sc_id ) {
+    print 'No old service check ID given.  Available choices are: ', $/;
+
+    my $odw_servicechecks = Odw::Servicecheck->search( { hostname => $hostname, } );
+
+    while ( my $service_object = $odw_servicechecks->next ) {
+        print $TAB, $service_object->id, ' -> ', $service_object->name, $/;
+    }
+    exit 1;
+}
+
+if ( $old_sc_id =~ m/\D/xsm ) {
+    die 'Old service check ID must be a number', $/;
+}
+
+if ( !$new_sc_id ) {
+    print 'No new service check ID given.  Available choices are: ', $/;
+
+    my $odw_servicechecks = Odw::Servicecheck->search( { hostname => $hostname, } );
+
+    while ( my $service_object = $odw_servicechecks->next ) {
+        if ( $service_object->id eq $old_sc_id ) {
+            next;
+        }
+        print $TAB, $service_object->id, ' -> ', $service_object->name, $/;
+    }
+    exit 1;
+}
+
+if ( $new_sc_id =~ m/\D/xsm ) {
+    die 'New service check ID must be a number', $/;
+}
+
+if ( $old_sc_id == $new_sc_id ) {
+    die 'Old ID is the same as the new ID.', $/;
+}
+
+my $old_sc_object = Odw::Servicecheck->retrieve($old_sc_id);
+
+if ( !$old_sc_object ) {
+    die 'Could not find service check ID ', $old_sc_id, ' in the ODW database', $/;
+}
+
+my $new_sc_object = Odw::Servicecheck->retrieve($new_sc_id);
+
+if ( !$new_sc_object ) {
+    die 'Could not find service check ID ', $new_sc_id, ' in the ODW database', $/;
+}
+
+$logger->warn( 'Changing name on servicechecks.id=',             $old_sc_object->id, ' from "', $old_sc_object->name,             '" to be "', $new_sc_object->name,             '"' );
+$logger->warn( 'Changing nagios_object_id on servicechecks.id=', $old_sc_object->id, ' from "', $old_sc_object->nagios_object_id, '" to be "', $new_sc_object->nagios_object_id, '"' );
+$logger->warn( 'Setting most_recent on servicechecks.id=',       $old_sc_object->id, ' to be 0' );
+
+$old_sc_object->name( $new_sc_object->name );
+$old_sc_object->nagios_object_id( $new_sc_object->nagios_object_id );
+$old_sc_object->most_recent(0);
+$old_sc_object->update;
+
+__END__
+# Remaining POD for man page/help text
+
+=head1 NOTES
+
+Changes as logged under 'WARN' into the F<opsviewd.log> logfile
+
+=head1 FILES
+
+F</var/log/opsview/opsviewd.log> - actions taken are logged into here
+
+=head1 AUTHOR AND COPYRIGHT
+
+Copyright (C) 2003-2012 Opsview Limited. All rights reserved
+
+This is free software; you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation; either version 2 of the License, or
+(at your option) any later version.
+
+This software is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with Opsview; if not, write to the Free Software
+Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
+
+=head1 KNOWN BUGS
+
+None at this time
+
+=head1 SEE ALSO
+
+L<perl>
+
+L<http://docs.opsview.com/>
+
+=cut
