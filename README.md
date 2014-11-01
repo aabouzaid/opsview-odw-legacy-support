@@ -17,12 +17,11 @@ For more information please check:<br>
 #####NOTES:
 1. All ODW files/scripts are from Opsview Community 20120424 (The last Community Version).<br>
 2. This script tested with Opsview Core 3.20131016.0 and RHEL/Cetnos 6.5.<br>
-3. Some Opsview scripts have multi fuctions beside ODW functions, so all files included with odw_legacy_support script get back to ODW only, and any script has multi functions didn't included. (e.g. utils/rename_host script)"<br>
+3. Some Opsview scripts have multi fuctions beside ODW functions, and any script has multi functions didn't included. (e.g. utils/rename_host script). So all files included with odw_legacy_support script get back to ODW only."<br>
 4. This script working and tested with option "enable_odw_import" only, the option "enable_full_odw_import" didn't tested practically yet.<br>
 
 #####VERSION:
 ODW legacy support script v0.3 - 1 November 2014.
-
 
 #####BY:
 Ahmed M. AbouZaid (www.aabouzaid.com) - Under MIT license.<br>
