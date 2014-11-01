@@ -128,7 +128,7 @@ done
 echo "Creating ODW database and adding its user..."
 opsviewmysql_password=$(openssl rand -base64 8) &&
 config_odw_database() { cat << EOF
-  /* Creat ODW database and import its structure */
+    /* Creat ODW database and import its structure */
     CREATE DATABASE odw;
     USE odw;
     SOURCE odw_database_structure.sql;
@@ -144,7 +144,7 @@ config_odw_database() { cat << EOF
 EOF
 }
 
-if [[ -f /root/.my.cnf || -s /root/.my.cnf ]]; then
+if [[ -f /root/.my.cnf && -s /root/.my.cnf ]]; then
     config_odw_database | mysql
 elif egrep -q "user=.?root.?" /etc/my.cnf; then
     config_odw_database | mysql
