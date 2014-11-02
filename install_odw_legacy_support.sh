@@ -77,7 +77,7 @@ find ./ODW_files/ -type f | while read odw_file_path; do
 
   dirname_of_odw_file=$(dirname $odw_file_path)
 
-  #Print message when start copying each directory and set its path in nagios.
+  #Set directories variables.
   case $dirname_of_odw_file in
     "$ODW_FILES_PATH/Bin")
       dir="Bin"
@@ -105,6 +105,7 @@ find ./ODW_files/ -type f | while read odw_file_path; do
     ;;
   esac
 
+  #Print message when start copying each directory and set its path in nagios.
   if [[ $dirname_of_odw_file != $dirname_of_previous_odw_file ]]; then
     echo -e "\nCopying ODW/$dir files ..."
   fi
