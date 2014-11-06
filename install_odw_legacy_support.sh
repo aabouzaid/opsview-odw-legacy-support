@@ -71,6 +71,10 @@ echo "REMEMBER! some Opsview scripts have multi fuctions plus ODW function, \
 and any script has multi functions didn't included (e.g. utils/rename_host script). \
 So all files included with odw_legacy_support script get back to ODW only."
 
+if [[ ! -d /usr/local/nagios/lib/Odw/ ]]; then
+    mkdir /usr/local/nagios/lib/Odw/
+    chown nagios:nagios /usr/local/nagios/lib/Odw/
+fi
 ODW_FILES_PATH="./ODW_files"
 
 find ./ODW_files/ -type f | while read odw_file_path; do
@@ -92,7 +96,6 @@ find ./ODW_files/ -type f | while read odw_file_path; do
       nagios_copy_path="/usr/local/nagios/lib"
     ;;
     "$ODW_FILES_PATH/Lib/Odw")
-      [[ ! -d /usr/local/nagios/lib/Odw/ ]] && mkdir /usr/local/nagios/lib/Odw/
       nagios_copy_path="/usr/local/nagios/lib/Odw"
     ;;
     "$ODW_FILES_PATH/Libexec")
