@@ -24,7 +24,6 @@
 # VERSION:
 #	ODW legacy support script v0.3 - 1 November 2014.
 #
-#
 # BY:
 #	Ahmed M. AbouZaid (www.aabouzaid.com) - Under MIT license.
 #	All copyright of "ODW" scripts goes to "Opsview Limited" and licensed under the terms of the GNU General Public License Version 2.
@@ -129,46 +128,6 @@ done
 
 
 ##############################################################
-# Configure database.
-##############################################################
-
-#Creating ODW database and user.
-echo "Creating ODW database and adding its user..."
-opsviewmysql_password=$(openssl rand -base64 8) &&
-config_odw_database() { cat << EOF
-    /* Creat ODW database and import its structure */
-    CREATE DATABASE odw;
-    USE odw;
-    SOURCE odw_database_structure.sql;
-
-    /* Add ODW user */
-    GRANT SELECT ON *.* TO 'odw'@'localhost' IDENTIFIED BY '$opsviewmysql_password';
-    GRANT ALL PRIVILEGES ON odw.* TO 'odw'@'localhost';
-    FLUSH privileges;
-
-    /* Enable ODW in opsview database */
-    USE opsview;
-    UPDATE systempreferences SET enable_odw_import='1';
-EOF
-}
-
-if [[ -f /root/.my.cnf && -s /root/.my.cnf ]]; then
-    config_odw_database | mysql
-elif egrep -q "user=.?root.?" /etc/my.cnf; then
-    config_odw_database | mysql
-else
-    echo 'Cannot connect to MySQL! You neet to enter MySQL root password!'
-    config_odw_database | mysql -u root -p
-fi
-
-#Unhash next line if you need to enable "enable_full_odw_import" option (UNTESTED).
-#mysql -e "USE opsview; UPDATE systempreferences SET enable_full_odw_import='1';"
-
-#Check exit status of previous operation.
-check_exit_status
-
-
-##############################################################
 # Modify configuration files.
 ##############################################################
 
@@ -211,6 +170,46 @@ sed -i '/sub hostgroup_info_url/a\
 #Added by odw_legacy_support script (https://github.com/AAbouZaid/ODW-Legacy-Support).\
 sub enable_odw_import          { return _pref( shift, "enable_odw_import",          shift ); }\
 sub enable_full_odw_import     { return _pref( shift, "enable_full_odw_import",     shift ); }' /usr/local/nagios/lib/Opsview/Systempreference.pm
+#Check exit status of previous operation.
+check_exit_status
+
+
+##############################################################
+# Configure database.
+##############################################################
+
+#Creating ODW database and user.
+echo "Creating ODW database and adding its user..."
+opsviewmysql_password=$(openssl rand -base64 8) &&
+config_odw_database() { cat << EOF
+    /* Creat ODW database and import its structure */
+    CREATE DATABASE odw;
+    USE odw;
+    SOURCE odw_database_structure.sql;
+
+    /* Add ODW user */
+    GRANT SELECT ON *.* TO 'odw'@'localhost' IDENTIFIED BY '$opsviewmysql_password';
+    GRANT ALL PRIVILEGES ON odw.* TO 'odw'@'localhost';
+    FLUSH privileges;
+
+    /* Enable ODW in opsview database */
+    USE opsview;
+    UPDATE systempreferences SET enable_odw_import='1';
+EOF
+}
+
+if [[ -f /root/.my.cnf && -s /root/.my.cnf ]]; then
+    config_odw_database | mysql
+elif egrep -q "user=.?root.?" /etc/my.cnf; then
+    config_odw_database | mysql
+else
+    echo 'Cannot connect to MySQL! You neet to enter MySQL root password!'
+    config_odw_database | mysql -u root -p
+fi
+
+#Unhash next line if you need to enable "enable_full_odw_import" option (UNTESTED).
+#mysql -e "USE opsview; UPDATE systempreferences SET enable_full_odw_import='1';"
+
 #Check exit status of previous operation.
 check_exit_status
 
