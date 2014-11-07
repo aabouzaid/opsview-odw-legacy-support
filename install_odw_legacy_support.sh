@@ -108,7 +108,7 @@ find ./ODW_files/ -type f | while read odw_file_path; do
     ;;
   esac
 
-  #Print message when start copying each directory and set its path in nagios.
+  #Print message when start copying each directory.
   if [[ $dirname_of_odw_file != $dirname_of_previous_odw_file ]]; then
     echo -e "\nCopying ODW/$dir files ..."
   fi
