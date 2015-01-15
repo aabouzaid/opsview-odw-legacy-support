@@ -1,4 +1,4 @@
-ODW Legacy Support
+Opsview ODW Legacy Support
 ==================
 
 ![Alt text](Eenable_ODW_with_Opsview_Core.png?raw=true "Eenable ODW with Opsview Core")
