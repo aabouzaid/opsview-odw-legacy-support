@@ -51,7 +51,6 @@ start_error_logging | tee -a odw_legacy_installer_error.log
 #Displaying STDERR of script and logging it.
 exec 2> >(tee -a odw_legacy_installer_error.log >&2)
 
-
 #Check exit status and return message in the case of success or failure.
 check_exit_status () {
   if [[ $? = 0 ]]; then
@@ -66,9 +65,9 @@ check_exit_status () {
 # Copying ODW files ... Bin, Installer, Lib, Libexec and Utils.
 ##############################################################
 
-echo "REMEMBER! some Opsview scripts have multi fuctions plus ODW function, \
-and any script has multi functions didn't included (e.g. utils/rename_host script). \
-So all files included with odw_legacy_support script get back to ODW only."
+echo "REMEMBER! Some Opsview scripts have many uses in addition to ODW, \
+Thus if the script or module has more than one use -e.g. \"utils/rename_host\"- \
+will not included here. So all files included here are for ODW only."
 
 if [[ ! -d /usr/local/nagios/lib/Odw/ ]]; then
     mkdir /usr/local/nagios/lib/Odw/
