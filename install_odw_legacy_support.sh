@@ -2,7 +2,7 @@
 #
 #
 # SYNTAX:
-#	Don't have any, just run it.
+#	It doesn't have any, just run it.
 #
 # DESCRIPTION:
 #	Simple script to install "Opsview Data Warehouse" (ODW) that no longer available with "Opsview Core".
