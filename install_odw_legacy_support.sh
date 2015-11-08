@@ -85,6 +85,10 @@ find ./ODW_files/ -type f | while read odw_file_path; do
       dir="Bin"
       nagios_copy_path="/usr/local/nagios/bin"
     ;;
+    "$ODW_FILES_PATH/Import")
+      dir="Import"
+      nagios_copy_path="/usr/local/nagios/import"
+    ;;
     "$ODW_FILES_PATH/Installer")
       dir="Installer"
       nagios_copy_path="/usr/local/nagios/installer"
@@ -184,7 +188,7 @@ config_odw_database() { cat << EOF
     /* Creat ODW database and import its structure */
     CREATE DATABASE odw;
     USE odw;
-    SOURCE odw_database_structure.sql;
+    SOURCE /usr/local/nagios/import/odw_database_structure.sql;
 
     /* Add ODW user */
     GRANT SELECT ON *.* TO 'odw'@'localhost' IDENTIFIED BY '$opsviewmysql_password';
